@@ -1,2 +1,0 @@
-# sgiptv
-sgitv
