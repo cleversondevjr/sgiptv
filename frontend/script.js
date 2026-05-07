@@ -1,4 +1,4 @@
-const API = "https://sgiptv-backend.onrender.com";
+const API = window.API_BASE_URL || "https://api.sgiptv.com.br";
 let pixStatusTimer = null;
 let pixCountdownTimer = null;
 
