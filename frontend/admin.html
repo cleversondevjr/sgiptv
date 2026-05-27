@@ -6,6 +6,12 @@
   <title>Painel Admin - SG IPTV</title>
 
   <link rel="icon" href="/favicon.ico">
+  <link rel="manifest" href="/admin-manifest.webmanifest">
+  <meta name="theme-color" content="#05000f">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="SG IPTV Admin">
+  <link rel="apple-touch-icon" href="/assets/pwa/admin-192.png">
   <link rel="stylesheet" href="cliente.css?v=20260428">
 </head>
 <body>
@@ -26,7 +32,8 @@
       <button id="btnTestes" onclick="mostrarSecaoAdmin('testes')">Testes IPTV</button>
       <button id="btnClientes" onclick="mostrarSecaoAdmin('clientes')">Clientes</button>
       <button id="btnRevendedores" onclick="mostrarSecaoAdmin('revendedores')">Revendedores</button>
-      <button onclick="carregarPagamentos(); carregarTestes();">Atualizar Dados</button>
+      <button id="btnFarm" onclick="mostrarSecaoAdmin('farm')">FARM</button>
+      <button onclick="atualizarDadosAdmin()">Atualizar Dados</button>
     </div>
 
     <div id="adminMensagem"></div>
@@ -69,6 +76,7 @@
               <th>WhatsApp</th>
               <th>Login</th>
               <th>Senha</th>
+              <th>Status</th>
               <th>Detalhes</th>
             </tr>
           </thead>
@@ -91,6 +99,7 @@
               <th>Senha</th>
               <th>Criado em</th>
               <th>Expira em</th>
+              <th>Acoes</th>
             </tr>
           </thead>
           <tbody id="listaTestes"></tbody>
@@ -105,12 +114,14 @@
         <table>
           <thead>
             <tr>
+              <th>ID</th>
               <th>Usuario</th>
               <th>Senha</th>
               <th>Plano</th>
               <th>Conexoes</th>
               <th>Vencimento</th>
               <th>Contato</th>
+              <th>Acoes</th>
             </tr>
           </thead>
           <tbody id="listaClientes"></tbody>
@@ -128,6 +139,7 @@
               <th>Nome</th>
               <th>Email</th>
               <th>Pix (CPF)</th>
+              <th>Comissao</th>
               <th>Bonus</th>
               <th>Acoes</th>
             </tr>
@@ -137,9 +149,90 @@
       </div>
     </section>
 
+    <section id="farm" class="renovar-box admin-section admin-hidden">
+      <h2>FARM</h2>
+      <p style="margin-top:-6px;">Sport Games Fazendinha (acesso administrativo).</p>
+
+      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin: 10px 0 12px;">
+        <a
+          href="/farm/download/fazendinha-online-latest.apk"
+          target="_blank"
+          rel="noopener"
+          style="display:inline-block; padding:10px 14px; border-radius:12px; background:#facc15; color:#0b0018; font-weight:900; text-decoration:none; border:1px solid rgba(0,0,0,.25);"
+        >Baixar APK (teste)</a>
+        <span style="color:rgba(255,255,255,.7); font-size:13px;">APK de testes (somente você). Se der 404, ainda não foi enviado para o servidor.</span>
+      </div>
+
+      <div class="tabela-area" style="padding:14px;">
+        <div style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px;">
+          <button class="btn btn-secondary" type="button" data-farm-tab="plantas">Plantas</button>
+          <button class="btn btn-secondary" type="button" data-farm-tab="loja">Loja</button>
+          <button class="btn btn-secondary" type="button" data-farm-tab="jogadores">Jogadores</button>
+          <button class="btn btn-secondary" type="button" data-farm-tab="eventos">Politicas</button>
+        </div>
+
+        <div id="farmTabPlantas" class="farmTab">
+          <div style="color:rgba(255,255,255,.8); font-size:13px; margin-bottom:10px;">
+            Em vez de abrir o jogo aqui, essa aba vai virar o painel de administracao do FARM (plantas, loja e jogadores).
+          </div>
+          <div id="farmPlantas"></div>
+        </div>
+
+        <div id="farmTabLoja" class="farmTab admin-hidden">
+          <div id="farmLoja"></div>
+        </div>
+
+        <div id="farmTabJogadores" class="farmTab admin-hidden">
+          <div id="farmJogadores"></div>
+        </div>
+
+        <div id="farmTabEventos" class="farmTab admin-hidden">
+          <div id="farmEventos"></div>
+        </div>
+      </div>
+    </section>
+
   </div>
 </div>
 
-<script src="admin.js?v=20260428"></script>
+<script src="admin.js?v=20260512"></script>
+<script>
+  // FARM tabs (admin area - do not load the game here)
+  (function () {
+    function bindFarmTabs() {
+      const tabs = Array.from(document.querySelectorAll("[data-farm-tab]"));
+      if (!tabs.length) return;
+
+      const panels = {
+        plantas: document.getElementById("farmTabPlantas"),
+        loja: document.getElementById("farmTabLoja"),
+        jogadores: document.getElementById("farmTabJogadores"),
+        eventos: document.getElementById("farmTabEventos"),
+      };
+
+      function activate(which) {
+        Object.entries(panels).forEach(([k, el]) => {
+          if (!el) return;
+          el.classList.toggle("admin-hidden", k !== which);
+        });
+        tabs.forEach((b) => b.classList.toggle("active", b.getAttribute("data-farm-tab") === which));
+      }
+
+      tabs.forEach((b) => {
+        if (b.__farmBound) return;
+        b.__farmBound = true;
+        b.addEventListener("click", () => activate(b.getAttribute("data-farm-tab") || "plantas"));
+      });
+
+      activate("plantas");
+    }
+
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", bindFarmTabs);
+    } else {
+      bindFarmTabs();
+    }
+  })();
+</script>
 </body>
 </html>
