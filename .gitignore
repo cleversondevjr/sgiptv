@@ -14,3 +14,7 @@ dist/
 build/
 .DS_Store
 
+frontend/*.bak
+frontend/*.bak*
+frontend/*.js.bak*
+sgiptv-farm/
