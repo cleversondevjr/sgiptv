@@ -32,8 +32,8 @@
       <button id="btnTestes" onclick="mostrarSecaoAdmin('testes')">Testes IPTV</button>
       <button id="btnClientes" onclick="mostrarSecaoAdmin('clientes')">Clientes</button>
       <button id="btnRevendedores" onclick="mostrarSecaoAdmin('revendedores')">Revendedores</button>
-      <button id="btnFarm" onclick="mostrarSecaoAdmin('farm')">FARM</button>
-      <button onclick="atualizarDadosAdmin()">Atualizar Dados</button>
+        <button id="btnFarm" onclick="mostrarSecaoAdmin('farm')">FARM</button>
+        <button onclick="atualizarDadosAdmin()">Atualizar Dados</button>
     </div>
 
     <div id="adminMensagem"></div>
@@ -150,89 +150,43 @@
     </section>
 
     <section id="farm" class="renovar-box admin-section admin-hidden">
-      <h2>FARM</h2>
-      <p style="margin-top:-6px;">Sport Games Fazendinha (acesso administrativo).</p>
+        <h2>FARM</h2>
+        <p style="margin-top:-6px;">Fazendinha Online (administracao).</p>
 
-      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin: 10px 0 12px;">
-        <a
-          href="/farm/download/fazendinha-online-latest.apk"
-          target="_blank"
-          rel="noopener"
-          style="display:inline-block; padding:10px 14px; border-radius:12px; background:#facc15; color:#0b0018; font-weight:900; text-decoration:none; border:1px solid rgba(0,0,0,.25);"
-        >Baixar APK (teste)</a>
-        <span style="color:rgba(255,255,255,.7); font-size:13px;">APK de testes (somente você). Se der 404, ainda não foi enviado para o servidor.</span>
-      </div>
-
-      <div class="tabela-area" style="padding:14px;">
-        <div style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px;">
-          <button class="btn btn-secondary" type="button" data-farm-tab="plantas">Plantas</button>
-          <button class="btn btn-secondary" type="button" data-farm-tab="loja">Loja</button>
-          <button class="btn btn-secondary" type="button" data-farm-tab="jogadores">Jogadores</button>
-          <button class="btn btn-secondary" type="button" data-farm-tab="eventos">Politicas</button>
+        <div class="admin-nav" style="margin-top: 0;">
+          <button type="button" onclick="abrirFarmLogin()">Login</button>
         </div>
 
-        <div id="farmTabPlantas" class="farmTab">
-          <div style="color:rgba(255,255,255,.8); font-size:13px; margin-bottom:10px;">
-            Em vez de abrir o jogo aqui, essa aba vai virar o painel de administracao do FARM (plantas, loja e jogadores).
+        <div class="admin-report" style="margin-top: 14px;">
+          <h3>APK</h3>
+          <p style="margin-top:-6px;">Nome do arquivo (precisa existir em <code>/farm/download/</code>).</p>
+          <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:10px;">
+            <input id="farmApkFile" value="fazendinha-online-latest.apk" style="min-width:280px; padding:10px 12px; border-radius:12px; border:1px solid rgba(126,34,206,.55); background:#05000f; color:#fff; font-weight:900;" />
+            <button type="button" onclick="baixarFarmApk()">Baixar APK</button>
           </div>
-          <div id="farmPlantas"></div>
+          <div style="margin-top:10px; color:rgba(255,255,255,.75); font-size:13px;">
+            URL: <code id="farmApkUrl">https://sgiptv.com.br/farm/download/fazendinha-online-latest.apk</code>
+          </div>
         </div>
 
-        <div id="farmTabLoja" class="farmTab admin-hidden">
-          <div id="farmLoja"></div>
+        <div class="admin-report" style="margin-top: 14px;">
+          <h3>Jogadores</h3>
+          <p style="margin-top:-6px;">Lista de contas (max 500). Banir impede login.</p>
+          <div class="admin-nav" style="margin-top: 0;">
+            <button type="button" onclick="carregarFarmUsuarios()">Atualizar lista</button>
+          </div>
+          <div id="farmJogadores" style="margin-top:12px;"></div>
         </div>
 
-        <div id="farmTabJogadores" class="farmTab admin-hidden">
-          <div id="farmJogadores"></div>
+        <div class="admin-report" style="margin-top: 14px;">
+          <h3>Em breve</h3>
+          <p style="margin-top:-6px;">Plantas, Loja, Jogadores, Diamantes, Banimentos e Logs (quando conectarmos a API do Farm).</p>
         </div>
-
-        <div id="farmTabEventos" class="farmTab admin-hidden">
-          <div id="farmEventos"></div>
-        </div>
-      </div>
-    </section>
+      </section>
 
   </div>
 </div>
 
-<script src="admin.js?v=20260512"></script>
-<script>
-  // FARM tabs (admin area - do not load the game here)
-  (function () {
-    function bindFarmTabs() {
-      const tabs = Array.from(document.querySelectorAll("[data-farm-tab]"));
-      if (!tabs.length) return;
-
-      const panels = {
-        plantas: document.getElementById("farmTabPlantas"),
-        loja: document.getElementById("farmTabLoja"),
-        jogadores: document.getElementById("farmTabJogadores"),
-        eventos: document.getElementById("farmTabEventos"),
-      };
-
-      function activate(which) {
-        Object.entries(panels).forEach(([k, el]) => {
-          if (!el) return;
-          el.classList.toggle("admin-hidden", k !== which);
-        });
-        tabs.forEach((b) => b.classList.toggle("active", b.getAttribute("data-farm-tab") === which));
-      }
-
-      tabs.forEach((b) => {
-        if (b.__farmBound) return;
-        b.__farmBound = true;
-        b.addEventListener("click", () => activate(b.getAttribute("data-farm-tab") || "plantas"));
-      });
-
-      activate("plantas");
-    }
-
-    if (document.readyState === "loading") {
-      document.addEventListener("DOMContentLoaded", bindFarmTabs);
-    } else {
-      bindFarmTabs();
-    }
-  })();
-</script>
+<script src="admin.js?v=farmusers1"></script>
 </body>
 </html>

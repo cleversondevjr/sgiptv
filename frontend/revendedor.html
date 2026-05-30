@@ -21,7 +21,12 @@
       <input type="email" id="revEmail" placeholder="Digite seu email" autocomplete="username">
 
       <label>Senha</label>
-      <input type="password" id="revSenha" placeholder="Digite sua senha" autocomplete="current-password">
+      <div class="password-field">
+        <input type="password" id="revSenha" placeholder="Digite sua senha" autocomplete="current-password">
+        <button type="button" class="password-toggle" data-toggle-password="revSenha" aria-label="Mostrar senha">
+          Mostrar
+        </button>
+      </div>
 
       <button type="submit">Entrar</button>
     </form>
@@ -65,16 +70,37 @@
     <div class="renovar-box">
       <h2>Comissoes</h2>
       <div class="tabela-area">
-        <table>
+        <table class="hist-table">
           <thead>
             <tr>
               <th>Data</th>
+              <th>Status</th>
               <th>Tipo</th>
               <th>Valor</th>
-              <th>Status</th>
+              <th>ID/Ref</th>
+              <th>Comprovante</th>
             </tr>
           </thead>
           <tbody id="revListaComissoes"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="renovar-box" style="margin-top:14px;">
+      <h2>Bonus</h2>
+      <div class="tabela-area">
+        <table class="hist-table">
+          <thead>
+            <tr>
+              <th>Data</th>
+              <th>Status</th>
+              <th>Tipo</th>
+              <th>Valor</th>
+              <th>ID/Ref</th>
+              <th>Comprovante</th>
+            </tr>
+          </thead>
+          <tbody id="revListaBonus"></tbody>
         </table>
       </div>
     </div>
@@ -92,7 +118,20 @@
       <input id="cadRevEmail" type="email" placeholder="seu@email.com">
 
       <label>Senha</label>
-      <input id="cadRevSenha" type="password" placeholder="Crie uma senha">
+      <div class="password-field">
+        <input id="cadRevSenha" type="password" placeholder="Crie uma senha">
+        <button type="button" class="password-toggle" data-toggle-password="cadRevSenha" aria-label="Mostrar senha">
+          Mostrar
+        </button>
+      </div>
+
+      <label>Repetir senha</label>
+      <div class="password-field">
+        <input id="cadRevSenha2" type="password" placeholder="Repita a senha">
+        <button type="button" class="password-toggle" data-toggle-password="cadRevSenha2" aria-label="Mostrar senha">
+          Mostrar
+        </button>
+      </div>
 
       <label>Nome completo</label>
       <input id="cadRevNome" type="text" placeholder="Seu nome completo">
@@ -113,5 +152,21 @@
 </div>
 
 <script src="revendedor.js"></script>
+<script>
+  (function () {
+    document.querySelectorAll("[data-toggle-password]").forEach(function (btn) {
+      var inputId = btn.getAttribute("data-toggle-password");
+      var input = inputId ? document.getElementById(inputId) : null;
+      if (!input) return;
+
+      btn.addEventListener("click", function () {
+        var visivel = input.type === "text";
+        input.type = visivel ? "password" : "text";
+        btn.textContent = visivel ? "Mostrar" : "Ocultar";
+        btn.setAttribute("aria-label", visivel ? "Mostrar senha" : "Ocultar senha");
+      });
+    });
+  })();
+</script>
 </body>
 </html>

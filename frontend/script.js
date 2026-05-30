@@ -1,4 +1,4 @@
-const API = "https://sgiptv-backend.onrender.com";
+const API = "https://api.sgiptv.com.br";
 let pixStatusTimer = null;
 let pixCountdownTimer = null;
 
@@ -271,6 +271,9 @@ async function gerarPix() {
     const data = await res.json();
 
     if (!res.ok) throw new Error(data.error || "Erro ao gerar Pix");
+    if (!data.payment_id || !data.qr_code || !data.qr_base64) {
+      throw new Error("Pix gerado sem identificacao (payment_id). Tente novamente.");
+    }
 
     const mensagemWhatsApp = encodeURIComponent(
       `Olá, segue comprovante de pagamento.\n\nPlano: ${plano}\nEmail: ${email}\nWhatsApp: ${telefone}`
@@ -282,6 +285,7 @@ async function gerarPix() {
       <p id="pixCountdown" class="pix-countdown">Calculando validade do Pix...</p>
       <textarea id="codigoPix" readonly>${escaparHtml(data.qr_code)}</textarea>
       <button class="generate-btn" onclick="copiarPix(this)">Copiar Pix</button>
+      <p style="margin-top:8px; color:#cbd5e1; font-size:12px;"><strong>Payment ID:</strong> ${escaparHtml(String(data.payment_id))}</p>
       <a class="whatsapp-btn" href="https://wa.me/5511919628194?text=${mensagemWhatsApp}" target="_blank" rel="noopener noreferrer">
         Enviar comprovante no WhatsApp
       </a>
@@ -363,9 +367,17 @@ async function gerarTesteGratis() {
     localStorage.setItem("cliente_email", email);
     localStorage.setItem("cliente_telefone", telefone);
 
+    // Backend retorna usuario/senha do teste para permitir login imediato.
+    if (data.usuario && data.senha) {
+      localStorage.setItem("cliente_usuario", String(data.usuario));
+      localStorage.setItem("cliente_senha", String(data.senha));
+    }
+
     resultado.innerHTML = `
       <h3 style="color:#22c55e;">Teste gerado com sucesso!</h3>
       <p>Redirecionando para a Area do Cliente...</p>
+      ${data.usuario ? `<p><strong>Usuario:</strong> ${escaparHtml(data.usuario)}</p>` : ""}
+      ${data.senha ? `<p><strong>Senha:</strong> ${escaparHtml(data.senha)}</p>` : ""}
     `;
 
     setTimeout(() => {
@@ -373,6 +385,6 @@ async function gerarTesteGratis() {
     }, 1500);
 
   } catch (error) {
-    resultado.innerHTML = `<h3 style="color:#ef4444;">Erro ao gerar teste</h3>`;
+    resultado.innerHTML = `<h3 style="color:#ef4444;">Erro ao gerar teste IPTV.</h3><p>${escaparHtml(error.message || "")}</p>`;
   }
 }

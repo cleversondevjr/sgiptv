@@ -36,7 +36,8 @@ app.use(cors({
     return callback(new Error("Origem nao permitida pelo CORS."));
   }
 }));
-app.use(express.json());
+// Precisamos aumentar o limite pois o admin pode anexar comprovante (base64) ao marcar pagamento.
+app.use(express.json({ limit: "6mb" }));
 
 const requiredEnv = [
   "ACCESS_TOKEN",
@@ -63,7 +64,9 @@ const JWT_SECRET = process.env.JWT_SECRET.trim();
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET?.trim() || "";
 const NOTIFICATION_URL =
   process.env.WEBHOOK_NOTIFICATION_URL?.trim() ||
-  "https://sgiptv-backend.onrender.com/webhook";
+  "https://api.sgiptv.com.br/webhook";
+
+const PIX_SYNC_INTERVAL_MS = Number(process.env.PIX_SYNC_INTERVAL_MS || 60_000);
 
 const ADMIN_EMAIL_AVISOS = "suportesgiptv01@gmail.com";
 const ADMIN_WHATSAPP_AVISOS = "5511919628194";
@@ -72,6 +75,13 @@ const ADMIN_EMAIL_VENCIMENTOS = "suportesgiptv01@gmail.com";
 const TELEGRAM_TIMEOUT_MS = Number(process.env.TELEGRAM_TIMEOUT_MS || 8000);
 
 const PLANOS = {
+  // Plano tecnico: apenas para testes (PIX de R$ 1,00).
+  teste_1_real: {
+    id: "teste_1_real",
+    nome: "Teste - 1 Real",
+    valor: 1,
+    dias: 0
+  },
   mensal_1_tela: {
     id: "mensal_1_tela",
     nome: "Mensal - 1 Tela",
@@ -126,6 +136,16 @@ const PLANO_LEGADO_POR_VALOR = {
   "80": "trimestral_1_tela",
   "140": "trimestral_2_telas"
 };
+
+async function limparTestesIptvAntigos() {
+  // Mantemos o registro do teste por 24h para auditoria, depois limpa.
+  // Nao apaga o cliente (tabela clientes), apenas a tabela de testes.
+  try {
+    await db.query(`DELETE FROM testes_iptv WHERE criado_em <= NOW() - interval '24 hours'`);
+  } catch (error) {
+    console.error("Erro ao limpar testes IPTV antigos:", error);
+  }
+}
 
 const TESTE_URLS = {
   iptv_com_adulto: "https://prpainel.online/api/chatbot/ywDm7Eb1pR/BV4D3rLaqZ",
@@ -213,6 +233,21 @@ function validarContato({ email, telefone }) {
 function obterPlano(planoId, valorLegado) {
   const id = String(planoId || PLANO_LEGADO_POR_VALOR[String(valorLegado)] || "").trim();
   return PLANOS[id] || null;
+}
+
+function normalizarNomePlanoParaCliente(pagamento) {
+  const planoRaw = String(pagamento?.plano || "").trim();
+  // Alguns fluxos antigos gravavam "C-<usuario>" em vez do nome do plano.
+  // Nesses casos, derivamos o nome pelo valor (mapeamento legado).
+  if (/^c-\d+$/i.test(planoRaw)) {
+    const p = obterPlano(null, pagamento?.valor);
+    return String(p?.nome || "MENSAL").trim();
+  }
+  // Se for "TESTE PIX - X", tira o prefixo para usar o nome real.
+  if (/^teste pix\s*-\s*/i.test(planoRaw)) {
+    return planoRaw.replace(/^teste pix\s*-\s*/i, "").trim() || planoRaw;
+  }
+  return planoRaw || "MENSAL";
 }
 
 function adicionarTempo(data, quantidade, unidade) {
@@ -455,7 +490,7 @@ function criarTransporterEmail() {
   if (brevoKey) {
     // Fallback via HTTP (porta 443), evita timeout de SMTP em alguns hosts.
     return {
-      async sendMail({ from, to, subject, text, html }) {
+      async sendMail({ from, to, subject, text, html, attachments }) {
         const baseFrom = String(from || process.env.EMAIL_FROM || "").trim();
         const fromEmail = extrairEmailFrom(baseFrom) || null;
         const fromName =
@@ -475,7 +510,22 @@ function criarTransporterEmail() {
             .map(email => ({ email })),
           subject,
           textContent: text || undefined,
-          htmlContent: html || undefined
+          htmlContent: html || undefined,
+          ...(Array.isArray(attachments) && attachments.length
+            ? {
+              attachment: attachments
+                .map(a => {
+                  if (!a) return null;
+                  const name = String(a.filename || a.name || "comprovante").trim();
+                  let content = "";
+                  if (Buffer.isBuffer(a.content)) content = a.content.toString("base64");
+                  else if (typeof a.content === "string") content = a.content;
+                  if (!content) return null;
+                  return { name, content };
+                })
+                .filter(Boolean)
+            }
+            : {})
         };
 
         const res = await fetch("https://api.brevo.com/v3/smtp/email", {
@@ -551,8 +601,15 @@ async function enviarEmailAvisoAdmin({ assunto, html, text }) {
       return false;
     }
 
-    const fromEmail = String(process.env.EMAIL_FROM || process.env.SMTP_USER || process.env.EMAIL_USER || "").trim();
-    const fromName = String(process.env.EMAIL_FROM_NAME || "SG IPTV").trim();
+    // EMAIL_FROM pode vir como: "Nome <email@dominio>" ou apenas "email@dominio".
+    // Evita montar strings invalidas do tipo: "\"Nome\" <Nome <email>>" (isso quebra a Brevo).
+    const baseFrom = String(process.env.EMAIL_FROM || "").trim();
+    const fromEmail =
+      extrairEmailFrom(baseFrom) ||
+      String(process.env.SMTP_USER || process.env.EMAIL_USER || "").trim();
+    const fromName =
+      extrairNomeFrom(baseFrom) ||
+      String(process.env.EMAIL_FROM_NAME || "SG IPTV").trim();
     const from = fromEmail ? `"${fromName}" <${fromEmail}>` : undefined;
 
     await transporter.sendMail({
@@ -591,6 +648,9 @@ async function enviarWhatsappAvisoAdmin(texto) {
       return false;
     }
 
+    // CallMeBot responde com texto simples. Logamos para auditoria/debug.
+    const respText = await res.text().catch(() => "");
+    console.log("WhatsApp admin enviado OK:", respText || "(sem corpo)");
     return true;
   } catch (error) {
     console.error("Erro ao enviar WhatsApp admin:", error);
@@ -605,10 +665,81 @@ function obterChatIdTelegram(tipo) {
     (tipo === "cliente" && process.env.TELEGRAM_CHAT_ID_CLIENTE) ||
     (tipo === "revendedor" && process.env.TELEGRAM_CHAT_ID_REVENDEDOR) ||
     (tipo === "vencimento_1d" && process.env.TELEGRAM_CHAT_ID_VENCIMENTO_1D) ||
+    (tipo === "vencimento_3d" && process.env.TELEGRAM_CHAT_ID_VENCIMENTO_3D) ||
     ""
   ).trim();
 
   return especifico || base;
+}
+
+async function enviarEmailPara(destinatario, { assunto, html, text, attachments } = {}) {
+  try {
+    const to = String(destinatario || "").trim();
+    if (!to) return false;
+
+    const transporter = criarTransporterEmail();
+    if (!transporter) return false;
+
+    const baseFrom = String(process.env.EMAIL_FROM || "").trim();
+    const fromEmail =
+      extrairEmailFrom(baseFrom) ||
+      String(process.env.SMTP_USER || process.env.EMAIL_USER || "").trim();
+    const fromName =
+      extrairNomeFrom(baseFrom) ||
+      String(process.env.EMAIL_FROM_NAME || "SG IPTV").trim();
+    const from = fromEmail ? `"${fromName}" <${fromEmail}>` : undefined;
+
+    await transporter.sendMail({
+      ...(from ? { from } : {}),
+      to,
+      subject: assunto,
+      text,
+      html,
+      ...(Array.isArray(attachments) && attachments.length ? { attachments } : {})
+    });
+
+    return true;
+  } catch (error) {
+    console.error("Erro ao enviar email:", error);
+    return false;
+  }
+}
+
+function normalizarAnexoComprovante(comprovante) {
+  if (!comprovante || typeof comprovante !== "object") return null;
+
+  const name = String(comprovante.name || "comprovante").trim().slice(0, 120);
+  let mime = String(comprovante.mime || "").trim().slice(0, 120);
+  const base64 = String(comprovante.base64 || "").trim();
+
+  if (!base64) return null;
+  if (!mime) {
+    const lower = name.toLowerCase();
+    if (lower.endsWith(".pdf")) mime = "application/pdf";
+    else if (lower.endsWith(".png")) mime = "image/png";
+    else if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) mime = "image/jpeg";
+    else mime = "application/octet-stream";
+  }
+
+  // Limite simples para evitar payloads gigantes (2MB base64 aprox 1.5MB bin).
+  if (base64.length > 2_800_000) return null;
+
+  let buf;
+  try {
+    buf = Buffer.from(base64, "base64");
+  } catch {
+    return null;
+  }
+  if (!buf || buf.length <= 0) return null;
+
+  const safeName = name.replace(/[^\w.\-()\s]/g, "_");
+
+  return {
+    filename: safeName || "comprovante",
+    content: buf,
+    contentType: mime,
+    size: buf.length
+  };
 }
 
 async function enviarTelegramAvisoAdmin(texto, tipo = "default") {
@@ -650,7 +781,7 @@ async function enviarTelegramAvisoAdmin(texto, tipo = "default") {
   }
 }
 
-async function notificarVendaAdmin({ tipo, pagamento, origem }) {
+async function notificarVendaAdmin({ tipo, pagamento, origem, telegramTipo = "default" }) {
   const p = enriquecerPagamento(pagamento);
 
   const credenciais = {
@@ -675,7 +806,8 @@ async function notificarVendaAdmin({ tipo, pagamento, origem }) {
 
   const texto = linhas.join("\n");
 
-  await enviarTelegramAvisoAdmin(texto, "pix");
+  // Envia para o chat especifico do assunto (pix/cliente/revendedor/vencimento_1d etc).
+  await enviarTelegramAvisoAdmin(texto, telegramTipo);
 
   await enviarEmailAvisoAdmin({
     assunto: `${tipo} - SG IPTV`,
@@ -700,7 +832,6 @@ async function notificarVendaAdmin({ tipo, pagamento, origem }) {
   });
 
   await enviarWhatsappAvisoAdmin(texto);
-  await enviarTelegramAvisoAdmin(texto);
 }
 
 function phoneToBr(phoneDigits) {
@@ -711,8 +842,10 @@ function phoneToBr(phoneDigits) {
 }
 
 async function avisarVencimentosClientes() {
+  // Avisos de vencimento precisam rodar automaticamente (sem depender de login do cliente).
+  // Email e opcional; Telegram deve funcionar mesmo sem SMTP configurado.
   const transporter = criarTransporterEmail();
-  if (!transporter) return;
+  const podeEnviarEmail = Boolean(transporter && ADMIN_EMAIL_VENCIMENTOS);
 
   // Evita spam: envia no maximo 1x por dia por tipo de aviso.
   const result = await db.query(`
@@ -730,12 +863,11 @@ async function avisarVencimentosClientes() {
 
     const diffDias = Math.ceil((venc.getTime() - agora) / umDiaMs);
 
-    const deveAvisar3d = diffDias === 3 && (!c.aviso_3d_em || (agora - new Date(c.aviso_3d_em).getTime()) > umDiaMs);
     const deveAvisar1d = diffDias === 1 && (!c.aviso_1d_em || (agora - new Date(c.aviso_1d_em).getTime()) > umDiaMs);
 
-    if (!deveAvisar3d && !deveAvisar1d) continue;
+    if (!deveAvisar1d) continue;
 
-    const tipo = deveAvisar1d ? "Vencimento em 1 dia" : "Vencimento em 3 dias";
+    const tipo = "Vencimento em 1 dia";
     const nome = String(c.nome || "").trim();
     const texto = `
 ${tipo} - SG IPTV
@@ -750,26 +882,69 @@ WhatsApp: ${c.telefone || "-"}
 Painel Admin: ${ADMIN_PANEL_URL}
     `.trim();
 
-    await transporter.sendMail({
-      from: `"SG IPTV" <${process.env.EMAIL_USER}>`,
-      to: ADMIN_EMAIL_VENCIMENTOS,
-      subject: `${tipo} - ${c.usuario}`,
-      text: texto
-    });
+    // Telegram (principal)
+    await enviarTelegramAvisoAdmin(texto, "vencimento_1d");
 
-    if (deveAvisar1d) {
-      await enviarTelegramAvisoAdmin(texto, "vencimento_1d");
+    // Email (opcional)
+    if (podeEnviarEmail) {
+      try {
+        const baseFrom = String(process.env.EMAIL_FROM || "").trim();
+        const fromEmail =
+          extrairEmailFrom(baseFrom) ||
+          String(process.env.SMTP_USER || process.env.EMAIL_USER || "").trim();
+        const fromName =
+          extrairNomeFrom(baseFrom) ||
+          String(process.env.EMAIL_FROM_NAME || "SG IPTV").trim();
+        const from = fromEmail ? `"${fromName}" <${fromEmail}>` : undefined;
+
+        await transporter.sendMail({
+          ...(from ? { from } : {}),
+          to: ADMIN_EMAIL_VENCIMENTOS,
+          subject: `${tipo} - ${c.usuario}`,
+          text: texto
+        });
+      } catch (error) {
+        console.error("Erro ao enviar email de vencimento (continuando):", error);
+      }
     }
 
     try {
       await db.query(
-        `UPDATE clientes SET ${deveAvisar1d ? "aviso_1d_em" : "aviso_3d_em"} = NOW(), atualizado_em = NOW() WHERE id = $1`,
+        `UPDATE clientes SET aviso_1d_em = NOW(), atualizado_em = NOW() WHERE id = $1`,
         [c.id]
       );
     } catch (error) {
       console.error("Erro ao salvar aviso de vencimento:", error);
     }
   }
+}
+
+// Scheduler: roda avisos de vencimento todo dia as 09:00 (horario local do servidor).
+let ultimoDiaAvisoVencimento = null; // YYYY-MM-DD
+function iniciarSchedulerVencimentos() {
+  const tick = async () => {
+    try {
+      const agora = new Date();
+      const yyyy = String(agora.getFullYear());
+      const mm = String(agora.getMonth() + 1).padStart(2, "0");
+      const dd = String(agora.getDate()).padStart(2, "0");
+      const dia = `${yyyy}-${mm}-${dd}`;
+
+      if (agora.getHours() === 9 && agora.getMinutes() === 0) {
+        if (ultimoDiaAvisoVencimento !== dia) {
+          ultimoDiaAvisoVencimento = dia;
+          await avisarVencimentosClientes();
+        }
+      }
+    } catch (err) {
+      console.error("Erro scheduler vencimentos (continuando):", err);
+    }
+  };
+
+  // checa a cada 60s (suficiente)
+  setInterval(tick, 60 * 1000);
+  // roda uma vez logo ao subir para nao depender do primeiro tick
+  setTimeout(tick, 5 * 1000);
 }
 
 async function enviarEmailVencimentoTeste({ dias, cliente }) {
@@ -794,8 +969,15 @@ WhatsApp: ${cliente.telefone || "-"}
 Painel Admin: ${ADMIN_PANEL_URL}
   `.trim();
 
-  const fromEmail = String(process.env.EMAIL_FROM || process.env.SMTP_USER || process.env.EMAIL_USER || "").trim();
-  const fromName = String(process.env.EMAIL_FROM_NAME || "SG IPTV").trim();
+  // EMAIL_FROM pode ser "Nome <email@dominio>" ou apenas "email@dominio".
+  // Precisamos extrair o email real; caso contrario a Brevo rejeita com "valid sender email required".
+  const baseFrom = String(process.env.EMAIL_FROM || "").trim();
+  const fromEmail =
+    extrairEmailFrom(baseFrom) ||
+    String(process.env.SMTP_USER || process.env.EMAIL_USER || "").trim();
+  const fromName =
+    extrairNomeFrom(baseFrom) ||
+    String(process.env.EMAIL_FROM_NAME || "SG IPTV").trim();
   const from = fromEmail ? `"${fromName}" <${fromEmail}>` : undefined;
 
   await transporter.sendMail({
@@ -842,10 +1024,64 @@ async function confirmarPagamentoRecebido(pagamento, origem = "webhook") {
 
   const confirmado = result.rows[0] || pagamento;
 
+  const isTestePix = /^teste pix\s*-\s*/i.test(String(confirmado.plano || "").trim());
+
+  // Atualiza vencimento do cliente (renovacao) quando tivermos algum identificador do cliente.
+  try {
+    // PIX de teste: confirma e notifica, mas nao renova cliente, nao limpa teste IPTV e nao gera comissao.
+    if (!isTestePix) {
+      await aplicarRenovacaoCliente(confirmado);
+      await limparTesteIptvDoCliente({
+        usuario: confirmado.cliente_usuario,
+        email: confirmado.email,
+        telefone: confirmado.telefone
+      });
+      await garantirComissaoDoPagamentoConfirmado(confirmado);
+    }
+  } catch (e) {
+    console.error("Erro ao aplicar renovacao no cliente (continuando):", e);
+  }
+
   if (!confirmado.notificado_em) {
-    await notificarVendaAdmin({ tipo: "Pix recebido", pagamento: confirmado, origem });
+    await notificarVendaAdmin({ tipo: "Pix recebido", pagamento: confirmado, origem, telegramTipo: "pix" });
     try {
       await db.query("UPDATE pagamentos SET notificado_em = NOW() WHERE payment_id = $1", [String(confirmado.payment_id)]);
+    } catch (error) {
+      console.error("Erro ao salvar notificado_em:", error);
+    }
+  }
+
+  return confirmado;
+}
+
+// Garante efeitos colaterais de um pagamento confirmado (mesmo que ele ja tenha sido inserido como "confirmado").
+async function processarPagamentoConfirmado(confirmado, origem = "webhook") {
+  if (!confirmado || confirmado.status !== "confirmado") return confirmado;
+
+  const isTestePix = /^teste pix\s*-\s*/i.test(String(confirmado.plano || "").trim());
+
+  // Renovacao / limpeza / comissao
+  try {
+    // PIX de teste: confirma e notifica, mas nao renova cliente, nao limpa teste IPTV e nao gera comissao.
+    if (!isTestePix) {
+      await aplicarRenovacaoCliente(confirmado);
+      await limparTesteIptvDoCliente({
+        usuario: confirmado.cliente_usuario,
+        email: confirmado.email,
+        telefone: confirmado.telefone
+      });
+      await garantirComissaoDoPagamentoConfirmado(confirmado);
+    }
+  } catch (e) {
+    console.error("Erro ao aplicar renovacao no cliente (continuando):", e);
+  }
+
+  // Notificacao (apenas 1x)
+  if (!confirmado.notificado_em) {
+    await notificarVendaAdmin({ tipo: "Pix recebido", pagamento: confirmado, origem, telegramTipo: "pix" });
+    try {
+      await db.query("UPDATE pagamentos SET notificado_em = NOW(), atualizado_em = NOW() WHERE id = $1", [Number(confirmado.id)]);
+      confirmado.notificado_em = new Date();
     } catch (error) {
       console.error("Erro ao salvar notificado_em:", error);
     }
@@ -869,6 +1105,276 @@ async function sincronizarPagamentoMercadoPago(pagamento) {
   return pagamento;
 }
 
+function conexoesDoPlano(planoTexto) {
+  const plano = String(planoTexto || "").toLowerCase();
+  if (plano.includes("2 tela") || plano.includes("2 telas")) return 2;
+  return 1;
+}
+
+function calcularValorComissaoPrimeiraVenda({ plano = "", dias = 0, conexoes = 1 } = {}) {
+  const p = String(plano || "").toLowerCase();
+  const d = Number(dias) || 0;
+  const c = Number(conexoes) || 1;
+
+  // Regras atuais (painel):
+  // - Mensal 1 tela: R$ 10,00
+  // - Mensal 2 telas: R$ 15,00
+  // - 3 meses 1 tela: R$ 30,00
+  // - 3 meses 2 telas: R$ 45,00
+  const ehTresMeses = p.includes("3 mes") || d >= 90;
+  const ehMensal = p.includes("mensal") || d === 30;
+
+  if (ehTresMeses && c >= 2) return 45;
+  if (ehTresMeses) return 30;
+  if (ehMensal && c >= 2) return 15;
+  if (ehMensal) return 10;
+  return 0;
+}
+
+function calcularValorComissaoRenovacao({ valorPagamento = 0 } = {}) {
+  const v = Number(valorPagamento) || 0;
+  if (!Number.isFinite(v) || v <= 0) return 0;
+  // Renovacao: 10% do valor do plano.
+  return Math.round(v * 0.1 * 100) / 100;
+}
+
+async function garantirComissaoDoPagamentoConfirmado(pagamento) {
+  // Cria comissao pendente para o revendedor vinculado ao cliente, sem duplicar.
+  if (!pagamento || pagamento.status !== "confirmado") return;
+  if (!pagamento.id) return; // precisamos do id para FK (pagamento_id)
+
+  const usuario = String(pagamento.cliente_usuario || "").trim();
+  // Evita parâmetro NULL "sem tipo" no Postgres em algumas expressões com $2/$3.
+  // Preferimos string vazia e fazemos as checagens com "<> ''" no SQL.
+  const email = pagamento.email ? String(pagamento.email).trim().toLowerCase() : "";
+  const telefone = pagamento.telefone ? String(pagamento.telefone).replace(/\D/g, "") : "";
+  if (!usuario && !email && !telefone) return;
+
+  // IMPORTANTE: quando $2/$3 vem null, o Postgres pode não conseguir inferir o tipo do parâmetro
+  // em expressões como "email = $2". Por isso fazemos cast explícito para text.
+  let clienteRes;
+  try {
+    clienteRes = await db.query(
+      `
+      SELECT id, revendedor_id
+      FROM clientes
+      WHERE ($1 <> '' AND usuario = $1::text)
+         OR ($2::text <> '' AND email = $2::text)
+         OR ($3::text <> '' AND telefone = $3::text)
+      ORDER BY atualizado_em DESC, id DESC
+      LIMIT 1
+      `,
+      [usuario, email, telefone]
+    );
+  } catch (e) {
+    console.error("Erro em comissao(cliente lookup):", e?.message || e, { usuario, email, telefone, pagamento_id: pagamento.id });
+    throw e;
+  }
+  if (clienteRes.rows.length === 0) return;
+
+  const cliente = clienteRes.rows[0];
+  const revendedorId = cliente.revendedor_id ? Number(cliente.revendedor_id) : 0;
+  if (!revendedorId) return;
+
+  const jaExiste = await db.query(`SELECT 1 FROM comissoes WHERE pagamento_id = $1 LIMIT 1`, [Number(pagamento.id)]);
+  if (jaExiste.rows.length > 0) return;
+
+  let tipo = "renovacao";
+  try {
+    const prev = await db.query(
+      `
+      SELECT 1
+      FROM pagamentos p
+      WHERE p.status = 'confirmado'
+        AND p.id <> $1
+        AND (
+          ($2::text <> '' AND p.cliente_usuario = $2::text)
+          OR ($3::text <> '' AND p.email = $3::text)
+          OR ($4::text <> '' AND p.telefone = $4::text)
+        )
+      LIMIT 1
+      `,
+      [Number(pagamento.id), usuario, email, telefone]
+    );
+    if (prev.rows.length === 0) tipo = "primeira_compra";
+  } catch (e) {
+    console.error("Erro em comissao(prev check):", e?.message || e, { usuario, email, telefone, pagamento_id: pagamento.id });
+    tipo = "renovacao";
+  }
+
+  const dias = diasPlano(pagamento);
+  const conexoes = conexoesDoPlano(pagamento.plano);
+  const valor =
+    tipo === "primeira_compra"
+      ? calcularValorComissaoPrimeiraVenda({ plano: pagamento.plano, dias, conexoes })
+      : calcularValorComissaoRenovacao({ valorPagamento: pagamento.valor });
+  if (!valor || valor <= 0) return;
+
+  try {
+    await db.query(
+      `
+      INSERT INTO comissoes (revendedor_id, cliente_id, pagamento_id, tipo, valor, status, criado_em, atualizado_em)
+      VALUES ($1, $2, $3, $4, $5, 'pendente', NOW(), NOW())
+      `,
+      [revendedorId, Number(cliente.id), Number(pagamento.id), tipo, Number(valor)]
+    );
+  } catch (e) {
+    console.error("Erro em comissao(insert):", e?.message || e, { revendedorId, clienteId: cliente.id, pagamento_id: pagamento.id, tipo, valor });
+    throw e;
+  }
+}
+
+async function aplicarRenovacaoCliente(pagamento) {
+  if (!pagamento) return;
+
+  const usuario = String(pagamento.cliente_usuario || "").trim();
+  const senha = String(pagamento.cliente_senha || "").trim() || null;
+  const email = pagamento.email ? String(pagamento.email).trim().toLowerCase() : "";
+  const telefone = pagamento.telefone ? String(pagamento.telefone).replace(/\D/g, "") : "";
+
+  // Precisamos de algum identificador para achar o cliente.
+  if (!usuario && !email && !telefone) return;
+
+  const dias = diasPlano(pagamento);
+  const conexoes = conexoesDoPlano(pagamento.plano);
+  const nomePlano = normalizarNomePlanoParaCliente(pagamento);
+
+  // Pega vencimento atual para somar a partir do maior entre vencimento e agora.
+  const clienteAtual = await db.query(
+    `
+    SELECT id, vencimento
+    FROM clientes
+    WHERE ($1 <> '' AND usuario = $1)
+       OR ($2::text <> '' AND email = $2::text)
+       OR ($3::text <> '' AND telefone = $3::text)
+    ORDER BY atualizado_em DESC, id DESC
+    LIMIT 1
+    `,
+    [usuario, email, telefone]
+  );
+
+  if (clienteAtual.rows.length === 0) return;
+  const c = clienteAtual.rows[0];
+
+  const agora = new Date();
+  const vencAtual = c.vencimento ? new Date(c.vencimento) : null;
+  const base = (vencAtual && vencAtual > agora) ? vencAtual : agora;
+  const novoVenc = new Date(base);
+  novoVenc.setDate(novoVenc.getDate() + dias);
+
+  await db.query(
+    `
+    UPDATE clientes
+    SET plano = $2,
+        conexoes = $3,
+        vencimento = $4,
+        email = COALESCE($5, email),
+        telefone = COALESCE($6, telefone),
+        senha = COALESCE($7, senha),
+        atualizado_em = NOW()
+    WHERE id = $1
+    `,
+    [
+      c.id,
+      nomePlano,
+      conexoes,
+      novoVenc.toISOString(),
+      email,
+      telefone,
+      senha || null
+    ]
+  );
+}
+
+async function limparTesteIptvDoCliente({ usuario = "", email = null, telefone = null } = {}) {
+  const u = String(usuario || "").trim();
+  const e = email ? String(email).trim().toLowerCase() : "";
+  const t = telefone ? String(telefone).replace(/\D/g, "") : "";
+
+  if (!u && !e && !t) return;
+
+  try {
+    await db.query(
+      `
+      DELETE FROM testes_iptv
+      WHERE ($1 <> '' AND login = $1)
+         OR ($2::text <> '' AND email = $2::text)
+         OR ($3::text <> '' AND telefone = $3::text)
+      `,
+      [u, e, t]
+    );
+  } catch (e2) {
+    console.warn("Aviso: falha ao limpar teste_iptv do cliente:", e2?.message || e2);
+  }
+}
+
+async function backfillComissoesRecentes() {
+  // Gera comissoes faltantes para pagamentos confirmados recentes
+  // (ex.: confirmados antes da feature de comissoes existir).
+  try {
+    const result = await db.query(
+      `
+      SELECT p.*
+      FROM pagamentos p
+      LEFT JOIN comissoes c ON c.pagamento_id = p.id
+      WHERE p.status = 'confirmado'
+        AND c.id IS NULL
+        AND p.confirmado_em >= NOW() - INTERVAL '60 days'
+      ORDER BY p.confirmado_em DESC, p.id DESC
+      LIMIT 200
+      `
+    );
+
+    for (const p of result.rows) {
+      try {
+        await garantirComissaoDoPagamentoConfirmado(p);
+      } catch (e) {
+        console.error("Erro ao backfill de comissao (continuando):", e?.message || e);
+      }
+    }
+  } catch (e) {
+    console.error("Erro ao rodar backfillComissoesRecentes:", e?.message || e);
+  }
+}
+
+let pixSyncEmAndamento = false;
+async function sincronizarPixPendentesBackground() {
+  if (pixSyncEmAndamento) return;
+  pixSyncEmAndamento = true;
+  try {
+    // Limpeza leve antes de sincronizar.
+    await cancelarPagamentosPixExpirados();
+    await limparPagamentosCanceladosAntigos();
+
+    // Busca os mais recentes primeiro. Só PIX "de verdade" (payment_id numérico do MercadoPago).
+    const result = await db.query(
+      `
+      SELECT *
+      FROM pagamentos
+      WHERE status = $1
+        AND payment_id ~ '^[0-9]+$'
+        AND criado_em >= NOW() - INTERVAL '2 days'
+      ORDER BY criado_em DESC
+      LIMIT 50
+      `,
+      ["pendente"]
+    );
+
+    for (const pagamento of result.rows) {
+      try {
+        await sincronizarPagamentoMercadoPago(pagamento);
+      } catch (e) {
+        // Não derrubar o loop por um pagamento quebrado.
+        console.error("Falha ao sincronizar pagamento pendente (continuando):", e);
+      }
+    }
+  } catch (error) {
+    console.error("Erro no sincronizador de PIX pendente:", error);
+  } finally {
+    pixSyncEmAndamento = false;
+  }
+}
+
 async function cancelarPagamentosPixExpirados() {
   try {
     await db.query(
@@ -877,22 +1383,26 @@ async function cancelarPagamentosPixExpirados() {
       SET status = $1,
           cancelado_em = NOW()
       WHERE status = $2
-      AND criado_em <= NOW() - ($3 || ' minutes')::interval
+      AND criado_em <= NOW() - (($3::text) || ' minutes')::interval
       `,
       ["cancelado", "pendente", PIX_EXPIRACAO_MINUTOS]
     );
   } catch (error) {
     // Se a coluna ainda nao existir (migracao async), faz fallback sem cancelado_em.
     console.error("Erro ao cancelar Pix expirados (com cancelado_em). Tentando fallback:", error);
-    await db.query(
-      `
-      UPDATE pagamentos
-      SET status = $1
-      WHERE status = $2
-      AND criado_em <= NOW() - ($3 || ' minutes')::interval
-      `,
-      ["cancelado", "pendente", PIX_EXPIRACAO_MINUTOS]
-    );
+    try {
+      await db.query(
+        `
+        UPDATE pagamentos
+        SET status = $1
+        WHERE status = $2
+        AND criado_em <= NOW() - (($3::text) || ' minutes')::interval
+        `,
+        ["cancelado", "pendente", PIX_EXPIRACAO_MINUTOS]
+      );
+    } catch (fallbackError) {
+      console.error("Erro ao cancelar Pix expirados (fallback). Continuando:", fallbackError);
+    }
   }
 }
 
@@ -902,21 +1412,25 @@ async function limparPagamentosCanceladosAntigos() {
       `
       DELETE FROM pagamentos
       WHERE status = $1
-      AND COALESCE(cancelado_em, criado_em) <= NOW() - ($2 || ' minutes')::interval
+      AND COALESCE(cancelado_em, criado_em) <= NOW() - (($2::text) || ' minutes')::interval
       `,
       ["cancelado", PIX_EXPIRACAO_MINUTOS]
     );
   } catch (error) {
     // Fallback quando cancelado_em ainda nao existe.
     console.error("Erro ao limpar cancelados (com cancelado_em). Tentando fallback:", error);
-    await db.query(
-      `
-      DELETE FROM pagamentos
-      WHERE status = $1
-      AND criado_em <= NOW() - ($2 || ' minutes')::interval
-      `,
-      ["cancelado", PIX_EXPIRACAO_MINUTOS]
-    );
+    try {
+      await db.query(
+        `
+        DELETE FROM pagamentos
+        WHERE status = $1
+        AND criado_em <= NOW() - (($2::text) || ' minutes')::interval
+        `,
+        ["cancelado", PIX_EXPIRACAO_MINUTOS]
+      );
+    } catch (fallbackError) {
+      console.error("Erro ao limpar cancelados (fallback). Continuando:", fallbackError);
+    }
   }
 }
 
@@ -1094,7 +1608,8 @@ app.get("/revendedor/me", verificarTokenRevendedor, async (req, res) => {
     );
 
     const clientesAtivosMes = Number(stats.rows[0]?.clientes_ativos_mes || 0);
-    const bonusMes = clientesAtivosMes >= 15 ? 50 : 0;
+    // Bonus: pelo menos 10 vendas ativas no mes => R$ 50,00
+    const bonusMes = clientesAtivosMes >= 10 ? 50 : 0;
 
     return res.json({
       ok: true,
@@ -1117,10 +1632,27 @@ app.get("/revendedor/comissoes", verificarTokenRevendedor, async (req, res) => {
   try {
     const result = await db.query(
       `
-      SELECT id, tipo, valor, status, transacao_id, criado_em, pago_em
-      FROM comissoes
-      WHERE revendedor_id = $1
-      ORDER BY id DESC
+      SELECT
+        c.id,
+        c.tipo,
+        c.valor,
+        c.status,
+        c.transacao_id,
+        c.comprovante_nome,
+        c.comprovante_mime,
+        c.comprovante_tamanho,
+        c.criado_em,
+        c.pago_em,
+        c.pagamento_id,
+        c.cliente_id,
+        cl.usuario AS cliente_usuario,
+        cl.nome AS cliente_nome,
+        cl.email AS cliente_email,
+        cl.telefone AS cliente_telefone
+      FROM comissoes c
+      JOIN clientes cl ON cl.id = c.cliente_id
+      WHERE c.revendedor_id = $1
+      ORDER BY c.id DESC
       LIMIT 200
       `,
       [rid]
@@ -1133,9 +1665,218 @@ app.get("/revendedor/comissoes", verificarTokenRevendedor, async (req, res) => {
   }
 });
 
+// Baixar comprovante de uma comissao (para o revendedor ver no painel).
+app.get("/revendedor/comissoes/:id/comprovante", verificarTokenRevendedor, async (req, res) => {
+  const rid = req.revendedor.id;
+  const cid = String(req.params.id || "").trim();
+  if (!cid) return res.status(400).json({ error: "Informe o id da comissao." });
+
+  try {
+    const r = await db.query(
+      `
+      SELECT comprovante_nome, comprovante_mime, comprovante_bytes
+      FROM comissoes
+      WHERE id = $1 AND revendedor_id = $2
+      LIMIT 1
+      `,
+      [cid, rid]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ error: "Comissao nao encontrada." });
+    const row = r.rows[0];
+    if (!row.comprovante_bytes) return res.status(404).json({ error: "Comprovante nao encontrado." });
+
+    const filename = String(row.comprovante_nome || `comprovante-${cid}.pdf`).replace(/[\r\n]/g, "");
+    const mime = String(row.comprovante_mime || "application/octet-stream");
+
+    res.setHeader("Content-Type", mime);
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    return res.send(row.comprovante_bytes);
+  } catch (error) {
+    console.error("Erro ao baixar comprovante comissao:", error);
+    return res.status(500).json({ error: "Erro ao baixar comprovante." });
+  }
+});
+
+// Listar bonus pagos/pendentes do revendedor (para exibir comprovantes no painel).
+app.get("/revendedor/bonus", verificarTokenRevendedor, async (req, res) => {
+  const rid = req.revendedor.id;
+  try {
+    const r = await db.query(
+      `
+      SELECT id, mes, valor, status, transacao_id,
+             comprovante_nome, comprovante_mime, comprovante_tamanho,
+             criado_em, pago_em
+      FROM bonus_pagamentos
+      WHERE revendedor_id = $1
+      ORDER BY id DESC
+      LIMIT 24
+      `,
+      [rid]
+    );
+    return res.json({ ok: true, bonus: r.rows });
+  } catch (error) {
+    console.error("Erro revendedor/bonus:", error);
+    return res.status(500).json({ error: "Erro ao buscar bonus." });
+  }
+});
+
+// Baixar comprovante de bonus (revendedor).
+app.get("/revendedor/bonus/:id/comprovante", verificarTokenRevendedor, async (req, res) => {
+  const rid = req.revendedor.id;
+  const bid = String(req.params.id || "").trim();
+  if (!bid) return res.status(400).json({ error: "Informe o id do bonus." });
+
+  try {
+    const r = await db.query(
+      `
+      SELECT comprovante_nome, comprovante_mime, comprovante_bytes
+      FROM bonus_pagamentos
+      WHERE id = $1 AND revendedor_id = $2
+      LIMIT 1
+      `,
+      [bid, rid]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ error: "Bonus nao encontrado." });
+    const row = r.rows[0];
+    if (!row.comprovante_bytes) return res.status(404).json({ error: "Comprovante nao encontrado." });
+
+    const filename = String(row.comprovante_nome || `bonus-${bid}.pdf`).replace(/[\r\n]/g, "");
+    const mime = String(row.comprovante_mime || "application/octet-stream");
+    res.setHeader("Content-Type", mime);
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    return res.send(row.comprovante_bytes);
+  } catch (error) {
+    console.error("Erro ao baixar comprovante bonus (revendedor):", error);
+    return res.status(500).json({ error: "Erro ao baixar comprovante." });
+  }
+});
+
+// Baixar comprovante de comissao (admin).
+app.get("/admin/comissoes/:id/comprovante", verificarToken, async (req, res) => {
+  const cid = String(req.params.id || "").trim();
+  if (!cid) return res.status(400).json({ error: "Informe o id da comissao." });
+
+  try {
+    const r = await db.query(
+      `
+      SELECT comprovante_nome, comprovante_mime, comprovante_bytes
+      FROM comissoes
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [cid]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ error: "Comissao nao encontrada." });
+    const row = r.rows[0];
+    if (!row.comprovante_bytes) return res.status(404).json({ error: "Comprovante nao encontrado." });
+
+    const filename = String(row.comprovante_nome || `comprovante-${cid}.pdf`).replace(/[\r\n]/g, "");
+    const mime = String(row.comprovante_mime || "application/octet-stream");
+    res.setHeader("Content-Type", mime);
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    return res.send(row.comprovante_bytes);
+  } catch (error) {
+    console.error("Erro ao baixar comprovante comissao (admin):", error);
+    return res.status(500).json({ error: "Erro ao baixar comprovante." });
+  }
+});
+
+// Baixar comprovante de bonus (admin).
+app.get("/admin/bonus/:id/comprovante", verificarToken, async (req, res) => {
+  const bid = String(req.params.id || "").trim();
+  if (!bid) return res.status(400).json({ error: "Informe o id do bonus." });
+
+  try {
+    const r = await db.query(
+      `
+      SELECT comprovante_nome, comprovante_mime, comprovante_bytes
+      FROM bonus_pagamentos
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [bid]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ error: "Bonus nao encontrado." });
+    const row = r.rows[0];
+    if (!row.comprovante_bytes) return res.status(404).json({ error: "Comprovante nao encontrado." });
+
+    const filename = String(row.comprovante_nome || `bonus-${bid}.pdf`).replace(/[\r\n]/g, "");
+    const mime = String(row.comprovante_mime || "application/octet-stream");
+    res.setHeader("Content-Type", mime);
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    return res.send(row.comprovante_bytes);
+  } catch (error) {
+    console.error("Erro ao baixar comprovante bonus (admin):", error);
+    return res.status(500).json({ error: "Erro ao baixar comprovante." });
+  }
+});
+
+// Criar um bonus pendente de teste para um revendedor (apenas para homologacao).
+// Ex.: POST /admin/bonus/teste { revendedor_id: 4, valor: 50 }
+app.post("/admin/bonus/teste", verificarToken, async (req, res) => {
+  const rid = req.body && req.body.revendedor_id ? Number(req.body.revendedor_id) : 0;
+  const valor = req.body && req.body.valor != null ? Number(req.body.valor) : 50;
+  if (!rid) return res.status(400).json({ error: "Informe revendedor_id." });
+  if (!Number.isFinite(valor) || valor <= 0) return res.status(400).json({ error: "Informe um valor valido." });
+
+  try {
+    const rev = await db.query(`SELECT id FROM revendedores WHERE id = $1 LIMIT 1`, [rid]);
+    if (rev.rows.length === 0) return res.status(404).json({ error: "Revendedor nao encontrado." });
+
+    // Evita duplicar bonus pendente no mesmo mes.
+    const mes = await db.query(`SELECT date_trunc('month', NOW())::date AS mes`);
+    const m = mes.rows[0].mes;
+    const ja = await db.query(
+      `SELECT id FROM bonus_pagamentos WHERE revendedor_id = $1 AND mes = $2 AND status = 'pendente' LIMIT 1`,
+      [rid, m]
+    );
+    if (ja.rows.length > 0) {
+      return res.json({ ok: true, message: "Ja existe bonus pendente neste mes.", bonus_id: ja.rows[0].id });
+    }
+
+    const ins = await db.query(
+      `
+      INSERT INTO bonus_pagamentos (revendedor_id, mes, valor, status, criado_em, atualizado_em)
+      VALUES ($1, $2, $3, 'pendente', NOW(), NOW())
+      RETURNING id
+      `,
+      [rid, m, valor]
+    );
+
+    return res.json({ ok: true, bonus_id: ins.rows[0].id, mes: m, valor });
+  } catch (error) {
+    console.error("Erro ao criar bonus teste:", error);
+    return res.status(500).json({ error: "Erro ao criar bonus teste." });
+  }
+});
+
 db.query("SELECT NOW()")
   .then(res => console.log("Banco conectado:", res.rows))
   .catch(err => console.error("Erro no banco:", err));
+
+// Garante tabela pagamentos antes de qualquer ALTER TABLE (bases novas ou legadas podem nao ter).
+db.query(`
+  CREATE TABLE IF NOT EXISTS pagamentos (
+    id BIGSERIAL PRIMARY KEY,
+    email TEXT,
+    telefone TEXT,
+    plano TEXT NOT NULL,
+    valor NUMERIC(10, 2) NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pendente',
+    payment_id TEXT UNIQUE NOT NULL,
+    cliente_usuario TEXT,
+    cliente_senha TEXT,
+    confirmado_em TIMESTAMPTZ,
+    notificado_em TIMESTAMPTZ,
+    cancelado_em TIMESTAMPTZ,
+    aviso_24h_enviado_em TIMESTAMPTZ,
+    criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT pagamentos_status_check CHECK (status IN ('pendente', 'confirmado', 'cancelado'))
+  )
+`)
+  .then(() => console.log("Tabela pagamentos OK"))
+  .catch(err => console.error("Erro ao garantir tabela pagamentos:", err));
 
 async function limparRevendedoresSemClientesAtivos() {
   try {
@@ -1160,6 +1901,10 @@ async function limparRevendedoresSemClientesAtivos() {
 setInterval(limparRevendedoresSemClientesAtivos, 12 * 60 * 60 * 1000);
 limparRevendedoresSemClientesAtivos();
 
+// Limpa a tabela de testes a cada hora (mantem apenas 24h de historico).
+setInterval(limparTestesIptvAntigos, 60 * 60 * 1000);
+limparTestesIptvAntigos();
+
 db.query(`ALTER TABLE pagamentos ADD COLUMN IF NOT EXISTS aviso_24h_enviado_em TIMESTAMPTZ`)
   .then(() => console.log("Coluna aviso_24h_enviado_em OK"))
   .catch(err => console.error("Erro ao garantir coluna aviso_24h_enviado_em:", err));
@@ -1176,6 +1921,37 @@ db.query(`ALTER TABLE pagamentos ADD COLUMN IF NOT EXISTS notificado_em TIMESTAM
   .then(() => console.log("Coluna pagamentos.notificado_em OK"))
   .catch(err => console.error("Erro ao garantir coluna pagamentos.notificado_em:", err));
 
+db.query(`ALTER TABLE pagamentos ADD COLUMN IF NOT EXISTS origem TEXT`)
+  .then(() => console.log("Coluna pagamentos.origem OK"))
+  .catch(err => console.error("Erro ao garantir coluna pagamentos.origem:", err));
+
+db.query(`ALTER TABLE pagamentos ALTER COLUMN origem SET DEFAULT 'pix'`)
+  .then(() => {})
+  .catch(() => {});
+
+db.query(`UPDATE pagamentos SET origem = 'pix' WHERE origem IS NULL`)
+  .then(() => {})
+  .catch(() => {});
+
+// Bases legadas (ex: import/restores) podem nao ter criado_em/atualizado_em.
+// Sem isso, rotas de listagem/relatorio e limpeza por tempo estouram 500.
+db.query(`ALTER TABLE pagamentos ADD COLUMN IF NOT EXISTS criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()`)
+  .then(() => console.log("Coluna pagamentos.criado_em OK"))
+  .catch(err => console.error("Erro ao garantir coluna pagamentos.criado_em:", err));
+
+db.query(`ALTER TABLE pagamentos ADD COLUMN IF NOT EXISTS atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()`)
+  .then(() => console.log("Coluna pagamentos.atualizado_em OK"))
+  .catch(err => console.error("Erro ao garantir coluna pagamentos.atualizado_em:", err));
+
+// Se a coluna existia mas tinha nulos, preenche para manter queries funcionando.
+db.query(`UPDATE pagamentos SET criado_em = NOW() WHERE criado_em IS NULL`)
+  .then(() => {})
+  .catch(() => {});
+
+db.query(`UPDATE pagamentos SET atualizado_em = NOW() WHERE atualizado_em IS NULL`)
+  .then(() => {})
+  .catch(() => {});
+
 db.query(`ALTER TABLE pagamentos ADD COLUMN IF NOT EXISTS atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()`)
   .then(() => console.log("Coluna pagamentos.atualizado_em OK"))
   .catch(err => console.error("Erro ao garantir coluna pagamentos.atualizado_em:", err));
@@ -1187,6 +1963,19 @@ db.query(`ALTER TABLE pagamentos ADD COLUMN IF NOT EXISTS cliente_usuario TEXT`)
 db.query(`ALTER TABLE pagamentos ADD COLUMN IF NOT EXISTS cliente_senha TEXT`)
   .then(() => console.log("Coluna pagamentos.cliente_senha OK"))
   .catch(err => console.error("Erro ao garantir coluna pagamentos.cliente_senha:", err));
+
+// Bases restauradas/legadas podem nao ter a coluna telefone (WhatsApp) na tabela pagamentos.
+db.query(`ALTER TABLE pagamentos ADD COLUMN IF NOT EXISTS telefone TEXT`)
+  .then(() => console.log("Coluna pagamentos.telefone OK"))
+  .catch(err => console.error("Erro ao garantir coluna pagamentos.telefone:", err));
+
+// Permite confirmacao manual sem exigir email/telefone no DB (Pix normal segue validando no backend).
+db.query(`ALTER TABLE pagamentos ALTER COLUMN email DROP NOT NULL`)
+  .then(() => console.log("Pagamentos.email nullable OK"))
+  .catch(() => null);
+db.query(`ALTER TABLE pagamentos ALTER COLUMN telefone DROP NOT NULL`)
+  .then(() => console.log("Pagamentos.telefone nullable OK"))
+  .catch(() => null);
 
 db.query(`
   CREATE TABLE IF NOT EXISTS clientes (
@@ -1265,6 +2054,9 @@ db.query(`
     valor NUMERIC(10, 2) NOT NULL,
     status TEXT NOT NULL DEFAULT 'pendente',
     transacao_id TEXT,
+    comprovante_nome TEXT,
+    comprovante_mime TEXT,
+    comprovante_tamanho INTEGER,
     criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     pago_em TIMESTAMPTZ,
     atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -1274,6 +2066,64 @@ db.query(`
 `)
   .then(() => console.log("Tabela comissoes OK"))
   .catch(err => console.error("Erro ao garantir tabela comissoes:", err));
+
+db.query(`ALTER TABLE comissoes ADD COLUMN IF NOT EXISTS comprovante_nome TEXT`)
+  .catch(() => {});
+db.query(`ALTER TABLE comissoes ADD COLUMN IF NOT EXISTS comprovante_mime TEXT`)
+  .catch(() => {});
+db.query(`ALTER TABLE comissoes ADD COLUMN IF NOT EXISTS comprovante_tamanho INTEGER`)
+  .catch(() => {});
+db.query(`ALTER TABLE comissoes ADD COLUMN IF NOT EXISTS comprovante_bytes BYTEA`)
+  .catch(() => {});
+
+// Bonus do revendedor (pagamento manual registrado pelo admin).
+db.query(`
+  CREATE TABLE IF NOT EXISTS bonus_pagamentos (
+    id BIGSERIAL PRIMARY KEY,
+    revendedor_id BIGINT NOT NULL REFERENCES revendedores(id) ON DELETE CASCADE,
+    mes DATE NOT NULL,
+    valor NUMERIC(10, 2) NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pendente',
+    transacao_id TEXT,
+    comprovante_nome TEXT,
+    comprovante_mime TEXT,
+    comprovante_tamanho INTEGER,
+    comprovante_bytes BYTEA,
+    criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    pago_em TIMESTAMPTZ,
+    atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT bonus_pagamentos_status_check CHECK (status IN ('pendente', 'pago', 'falhou'))
+  )
+`)
+  .then(() => console.log("Tabela bonus_pagamentos OK"))
+  .catch(err => console.error("Erro ao garantir tabela bonus_pagamentos:", err));
+
+// Migra colunas em bases antigas (tabela criada antes de anexos/historico).
+db.query(`ALTER TABLE bonus_pagamentos ADD COLUMN IF NOT EXISTS transacao_id TEXT`).catch(() => {});
+db.query(`ALTER TABLE bonus_pagamentos ADD COLUMN IF NOT EXISTS comprovante_nome TEXT`).catch(() => {});
+db.query(`ALTER TABLE bonus_pagamentos ADD COLUMN IF NOT EXISTS comprovante_mime TEXT`).catch(() => {});
+db.query(`ALTER TABLE bonus_pagamentos ADD COLUMN IF NOT EXISTS comprovante_tamanho INTEGER`).catch(() => {});
+db.query(`ALTER TABLE bonus_pagamentos ADD COLUMN IF NOT EXISTS comprovante_bytes BYTEA`)
+  .catch(() => {});
+
+// Bases novas/limpas podem nao ter a tabela testes_iptv ainda.
+db.query(`
+  CREATE TABLE IF NOT EXISTS testes_iptv (
+    id BIGSERIAL PRIMARY KEY,
+    email TEXT NOT NULL,
+    telefone TEXT NOT NULL,
+    resposta TEXT NOT NULL,
+    login TEXT,
+    senha TEXT,
+    criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )
+`)
+  .then(() => console.log("Tabela testes_iptv OK"))
+  .catch(err => console.error("Erro ao garantir tabela testes_iptv:", err));
+
+db.query(`CREATE INDEX IF NOT EXISTS testes_iptv_email_telefone_idx ON testes_iptv (email, telefone)`)
+  .then(() => console.log("Indice testes_iptv_email_telefone_idx OK"))
+  .catch(err => console.error("Erro ao garantir indice testes_iptv_email_telefone_idx:", err));
 
 db.query(`ALTER TABLE testes_iptv ADD COLUMN IF NOT EXISTS login TEXT`)
   .then(() => console.log("Coluna testes_iptv.login OK"))
@@ -1286,6 +2136,18 @@ db.query(`ALTER TABLE testes_iptv ADD COLUMN IF NOT EXISTS senha TEXT`)
 app.get("/", (req, res) => {
   res.send("Backend funcionando 🚀");
 });
+
+// Garante que pagamentos PIX pendentes sejam sincronizados mesmo se o webhook falhar.
+// (Ex.: URL antiga, instabilidade do provedor, etc.)
+if (PIX_SYNC_INTERVAL_MS > 0) {
+  setInterval(sincronizarPixPendentesBackground, PIX_SYNC_INTERVAL_MS).unref?.();
+  // Roda uma vez no boot (não bloqueia o start do servidor).
+  setTimeout(sincronizarPixPendentesBackground, 5_000).unref?.();
+  console.log(`Sincronizador PIX pendente ativo: a cada ${PIX_SYNC_INTERVAL_MS}ms`);
+}
+
+// Garante comissoes para pagamentos confirmados recentes (feature nova).
+setTimeout(backfillComissoesRecentes, 10_000).unref?.();
 
 app.post("/pix", limitePublico, async (req, res) => {
   let { planoId, valor, email, telefone, cliente_usuario, cliente_senha } = req.body;
@@ -1309,6 +2171,7 @@ app.post("/pix", limitePublico, async (req, res) => {
   const clienteSenha = String(cliente_senha || "").trim() || null;
 
   try {
+    console.log("PIX /pix solicitado:", { planoId, valor, email, telefone });
     const payment = new Payment(client);
     const pixExpiraEm = adicionarTempo(new Date(), PIX_EXPIRACAO_MINUTOS, "minutos");
 
@@ -1326,21 +2189,24 @@ app.post("/pix", limitePublico, async (req, res) => {
     });
 
     const paymentId = String(result.id);
+    console.log("PIX /pix criado no MercadoPago:", { paymentId });
 
-    await db.query(
+    const insertResult = await db.query(
       `
-      INSERT INTO pagamentos (email, telefone, plano, valor, status, payment_id, cliente_usuario, cliente_senha)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      INSERT INTO pagamentos (email, telefone, plano, valor, status, payment_id, cliente_usuario, cliente_senha, origem)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       `,
-      [email, telefone, plano, valor, "pendente", paymentId, clienteUsuario, clienteSenha]
+      [email, telefone, plano, valor, "pendente", paymentId, clienteUsuario, clienteSenha, "pix"]
     );
+    console.log("PIX /pix registrado no banco:", { paymentId, inserted: insertResult?.rowCount ?? 0 });
 
     const data = result.point_of_interaction.transaction_data;
 
     await notificarVendaAdmin({
       tipo: "Novo Pix gerado",
       pagamento: { email, telefone, plano, valor, payment_id: paymentId },
-      origem: "pix"
+      origem: "pix",
+      telegramTipo: "pix"
     });
 
     res.json({
@@ -1415,9 +2281,11 @@ app.get("/pagamentos", verificarToken, async (req, res) => {
       if (restanteMs <= 0) continue;
 
       if (restanteMs <= 24 * 60 * 60 * 1000) {
-        await enviarEmailAvisoAdmin({
-          assunto: "Plano com menos de 24h - SG IPTV",
-          text: `
+        // Nunca deixe a listagem de pagamentos falhar por causa de notificacao.
+        try {
+          await enviarEmailAvisoAdmin({
+            assunto: "Plano com menos de 24h - SG IPTV",
+            text: `
 Plano com menos de 24h
 
 Email: ${pagamento.email}
@@ -1429,7 +2297,7 @@ Payment ID: ${pagamento.payment_id}
 
 Painel Admin: ${ADMIN_PANEL_URL}
           `,
-          html: `
+            html: `
             <div style="font-family: Arial, sans-serif; background:#05000f; color:#ffffff; padding:25px;">
               <div style="max-width:720px; margin:auto; background:#0b0018; border:1px solid #facc15; border-radius:14px; padding:25px;">
                 <h2 style="color:#facc15;">Plano com menos de 24h</h2>
@@ -1443,7 +2311,10 @@ Painel Admin: ${ADMIN_PANEL_URL}
               </div>
             </div>
           `
-        });
+          });
+        } catch (e) {
+          console.error("Falha ao enviar email 24h (continuando):", e);
+        }
 
         await db.query(
           `
@@ -1460,12 +2331,15 @@ Painel Admin: ${ADMIN_PANEL_URL}
     res.json(lista);
   } catch (error) {
     console.error("Erro ao buscar pagamentos:", error);
-    res.status(500).json({ error: "Erro ao buscar pagamentos" });
+    res.status(500).json({
+      error: "Erro ao buscar pagamentos",
+      detail: String(error?.message || error)
+    });
   }
 });
 
 app.post("/admin/pix/teste", verificarToken, async (req, res) => {
-  let { planoId, valor, email, telefone, cliente_usuario, cliente_senha } = req.body || {};
+  let { planoId, valor, email, telefone, cliente_usuario, cliente_senha, pix_expiracao_minutos } = req.body || {};
   const planoSelecionado = obterPlano(planoId, valor);
 
   if (!planoSelecionado) {
@@ -1482,12 +2356,19 @@ app.post("/admin/pix/teste", verificarToken, async (req, res) => {
   const plano = `TESTE PIX - ${planoSelecionado.nome}`;
   valor = planoSelecionado.valor;
 
-  const clienteUsuario = String(cliente_usuario || "").trim() || null;
-  const clienteSenha = String(cliente_senha || "").trim() || null;
+  // PIX de teste deve ficar vinculado a um cliente ficticio para facilitar auditoria no painel.
+  // Se o caller nao informar, usamos o padrao (usuario=TESTEPIX, senha=123456).
+  const clienteUsuario = String(cliente_usuario || "TESTEPIX").trim() || null;
+  const clienteSenha = String(cliente_senha || "123456").trim() || null;
 
   try {
     const payment = new Payment(client);
-    const pixExpiraEm = adicionarTempo(new Date(), PIX_EXPIRACAO_MINUTOS, "minutos");
+    const expMin = Number(pix_expiracao_minutos);
+    const minutosExp =
+      Number.isFinite(expMin) && expMin > 0 && expMin <= 24 * 60
+        ? expMin
+        : PIX_EXPIRACAO_MINUTOS;
+    const pixExpiraEm = adicionarTempo(new Date(), minutosExp, "minutos");
 
     const result = await payment.create({
       body: {
@@ -1527,11 +2408,103 @@ app.post("/admin/pix/teste", verificarToken, async (req, res) => {
       qr_base64: data.qr_code_base64,
       payment_id: paymentId,
       pix_expira_em: pixExpiraEm,
-      pix_expiracao_minutos: PIX_EXPIRACAO_MINUTOS
+      pix_expiracao_minutos: minutosExp
     });
   } catch (error) {
     console.error("Erro PIX teste:", error);
     res.status(500).json({ error: "Erro ao gerar Pix teste" });
+  }
+});
+
+// Importa um pagamento do Mercado Pago pelo ID (util quando um pagamento real foi feito mas nao ficou registrado no banco).
+// Observacao: nem sempre o Mercado Pago retorna telefone; nesses casos, salvamos telefone como null.
+app.post("/admin/pix/importar", verificarToken, async (req, res) => {
+  const paymentId = String(req.body?.payment_id || req.body?.paymentId || "").trim();
+  if (!paymentId || !/^[0-9]+$/.test(paymentId)) {
+    return res.status(400).json({ error: "Informe payment_id numerico." });
+  }
+
+  try {
+    const payment = new Payment(client);
+    const mp = await payment.get({ id: paymentId });
+
+    const plano = String(mp?.description || "Pagamento PIX (importado)").trim();
+    const valor = Number(mp?.transaction_amount || 0);
+    const email = String(mp?.payer?.email || "").trim() || null;
+    const telefone = null;
+
+    const status =
+      mp?.status === "approved" ? "confirmado" :
+      mp?.status === "cancelled" ? "cancelado" :
+      "pendente";
+
+    // Cria o registro se nao existir; se existir, atualiza status/origem.
+    const existente = await db.query(
+      "SELECT * FROM pagamentos WHERE payment_id = $1 LIMIT 1",
+      [paymentId]
+    );
+
+    let salvo;
+    if (existente.rows.length === 0) {
+      const insert = await db.query(
+        `
+        INSERT INTO pagamentos (email, telefone, plano, valor, status, payment_id, origem, confirmado_em)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, ${status === "confirmado" ? "NOW()" : "NULL"})
+        RETURNING *
+        `,
+        [email, telefone, plano, valor, status, paymentId, "pix_import"]
+      );
+      salvo = insert.rows[0];
+    } else {
+      const update = await db.query(
+        `
+        UPDATE pagamentos
+        SET status = $1,
+            origem = $2,
+            confirmado_em = CASE WHEN $1 = 'confirmado' AND confirmado_em IS NULL THEN NOW() ELSE confirmado_em END
+        WHERE payment_id = $3
+        RETURNING *
+        `,
+        [status, "pix_import", paymentId]
+      );
+      salvo = update.rows[0];
+    }
+
+    // Se veio aprovado e ainda nao notificou, notifica agora.
+    if (salvo?.status === "confirmado" && !salvo?.notificado_em) {
+      await notificarVendaAdmin({ tipo: "Pix recebido (importado)", pagamento: salvo, origem: "pix_import", telegramTipo: "pix" });
+      try {
+        await db.query("UPDATE pagamentos SET notificado_em = NOW() WHERE payment_id = $1", [paymentId]);
+      } catch {}
+    }
+
+    // Se confirmado, aplica renovacao/comissao e limpa teste (se existir).
+    if (salvo?.status === "confirmado") {
+      try {
+        await aplicarRenovacaoCliente(salvo);
+      } catch (e2) {
+        console.error("Erro ao aplicar renovacao (pix_import):", e2?.message || e2);
+      }
+
+      try {
+        await garantirComissaoDoPagamentoConfirmado(salvo);
+      } catch (e2) {
+        console.error("Erro ao garantir comissao (pix_import):", e2?.message || e2);
+      }
+
+      try {
+        await limparTesteIptvDoCliente({
+          usuario: salvo.cliente_usuario,
+          email: salvo.email,
+          telefone: salvo.telefone
+        });
+      } catch {}
+    }
+
+    return res.json({ ok: true, pagamento: enriquecerPagamento(salvo), mp_status: mp?.status || null });
+  } catch (error) {
+    console.error("Erro ao importar pagamento MP:", error);
+    return res.status(500).json({ error: "Erro ao importar pagamento do Mercado Pago.", detail: String(error?.message || error) });
   }
 });
 
@@ -1555,9 +2528,9 @@ app.get("/pagamentos/mes", verificarToken, async (req, res) => {
       SELECT *
       FROM pagamentos
       WHERE status = $1
-      AND criado_em >= $2
-      AND criado_em < $3
-      ORDER BY criado_em DESC, id DESC
+      AND COALESCE(confirmado_em, criado_em) >= $2
+      AND COALESCE(confirmado_em, criado_em) < $3
+      ORDER BY COALESCE(confirmado_em, criado_em) DESC, id DESC
       `,
       ["confirmado", inicio.toISOString(), fim.toISOString()]
     );
@@ -1575,7 +2548,10 @@ app.get("/pagamentos/mes", verificarToken, async (req, res) => {
     });
   } catch (error) {
     console.error("Erro ao buscar pagamentos do mes:", error);
-    res.status(500).json({ error: "Erro ao buscar pagamentos do mes" });
+    res.status(500).json({
+      error: "Erro ao buscar pagamentos do mes",
+      detail: String(error?.message || error)
+    });
   }
 });
 
@@ -1648,9 +2624,12 @@ Painel Admin: ${ADMIN_PANEL_URL}
 app.get("/clientes", verificarToken, async (req, res) => {
   try {
     const result = await db.query(`
-      SELECT *
-      FROM clientes
-      ORDER BY vencimento DESC, id DESC
+      SELECT
+        c.*,
+        r.codigo AS revendedor_codigo
+      FROM clientes c
+      LEFT JOIN revendedores r ON r.id = c.revendedor_id
+      ORDER BY c.vencimento DESC, c.id DESC
     `);
 
     res.json(result.rows);
@@ -1662,23 +2641,70 @@ app.get("/clientes", verificarToken, async (req, res) => {
 
 app.put("/clientes/:id", verificarToken, async (req, res) => {
   const { id } = req.params;
-  const { nome, email, telefone } = req.body || {};
+  const { nome, email, telefone, conexoes, vencimento, revendedor_codigo } = req.body || {};
+
+  let conexoesNumero = null;
+  if (conexoes !== undefined && conexoes !== null && String(conexoes).trim() !== "") {
+    const parsed = Number.parseInt(String(conexoes), 10);
+    if (Number.isNaN(parsed) || (parsed !== 1 && parsed !== 2)) {
+      return res.status(400).json({ error: "Conexoes invalido. Use 1 ou 2." });
+    }
+    conexoesNumero = parsed;
+  }
+
+  let vencimentoDate = null;
+  if (vencimento !== undefined && vencimento !== null && String(vencimento).trim() !== "") {
+    const d = new Date(String(vencimento));
+    if (Number.isNaN(d.getTime())) {
+      return res.status(400).json({ error: "Vencimento invalido. Use uma data/hora valida." });
+    }
+    vencimentoDate = d.toISOString();
+  }
 
   try {
+    let revendedorId = null;
+    const codigo = String(revendedor_codigo || "").trim().toUpperCase();
+    if (codigo) {
+      const rev = await db.query(
+        `
+        SELECT id, status
+        FROM revendedores
+        WHERE codigo = $1
+        LIMIT 1
+        `,
+        [codigo]
+      );
+
+      if (rev.rows.length === 0) {
+        return res.status(400).json({ error: "Codigo de revendedor nao encontrado." });
+      }
+      if (String(rev.rows[0].status || "").toLowerCase() !== "aprovado") {
+        return res.status(400).json({ error: "Revendedor ainda nao aprovado." });
+      }
+      revendedorId = rev.rows[0].id;
+    }
+
     const result = await db.query(
       `
       UPDATE clientes
       SET nome = $1,
           email = $2,
           telefone = $3,
+          conexoes = COALESCE($4, conexoes),
+          vencimento = COALESCE($5, vencimento),
+          revendedor_id = COALESCE($6, revendedor_id),
+          revendedor_vinculado_em = CASE WHEN $6 IS NOT NULL THEN NOW() ELSE revendedor_vinculado_em END,
           atualizado_em = NOW()
-      WHERE id = $4
+      WHERE id = $7
       RETURNING *
       `,
       [
         nome ? String(nome).trim() : null,
         email ? String(email).trim().toLowerCase() : null,
         telefone ? String(telefone).replace(/\\D/g, "") : null,
+        conexoesNumero,
+        vencimentoDate,
+        revendedorId,
         id
       ]
     );
@@ -1700,7 +2726,25 @@ app.get("/revendedores", verificarToken, async (req, res) => {
       `
       WITH mes AS (
         SELECT date_trunc('month', NOW()) AS inicio,
-               date_trunc('month', NOW()) + interval '1 month' AS fim
+               date_trunc('month', NOW()) + interval '1 month' AS fim,
+               date_trunc('month', NOW())::date AS mes_date
+      ),
+      comissao AS (
+        SELECT
+          revendedor_id,
+          COALESCE(SUM(CASE WHEN status = 'pendente' THEN valor ELSE 0 END), 0) AS total_pendente
+        FROM comissoes
+        GROUP BY revendedor_id
+      ),
+      bonus AS (
+        SELECT
+          revendedor_id,
+          COALESCE(SUM(CASE WHEN status = 'pago' THEN valor ELSE 0 END), 0) AS bonus_pago_mes,
+          COALESCE(SUM(CASE WHEN status = 'pendente' THEN valor ELSE 0 END), 0) AS bonus_pendente_mes
+        FROM bonus_pagamentos bp
+        JOIN mes m ON TRUE
+        WHERE bp.mes = m.mes_date
+        GROUP BY revendedor_id
       )
       SELECT
         r.id,
@@ -1709,7 +2753,10 @@ app.get("/revendedores", verificarToken, async (req, res) => {
         r.nome_completo,
         r.pix_cpf,
         r.status,
-        COALESCE(SUM(CASE WHEN c.status = 'pendente' THEN c.valor ELSE 0 END), 0) AS total_pendente,
+        COALESCE(c.total_pendente, 0) AS total_pendente,
+        COALESCE(b.bonus_pago_mes, 0) AS bonus_pago_mes,
+        COALESCE(b.bonus_pendente_mes, 0) AS bonus_pendente_mes,
+        COALESCE(b.bonus_pago_mes, 0) + COALESCE(b.bonus_pendente_mes, 0) AS bonus_mes,
         COALESCE((
           SELECT COUNT(DISTINCT cl.id)
           FROM pagamentos p
@@ -1719,28 +2766,22 @@ app.get("/revendedores", verificarToken, async (req, res) => {
             AND p.confirmado_em >= m.inicio
             AND p.confirmado_em < m.fim
             AND cl.revendedor_id = r.id
-        ), 0) AS clientes_ativos_mes,
-        CASE
-          WHEN COALESCE((
-            SELECT COUNT(DISTINCT cl2.id)
-            FROM pagamentos p2
-            JOIN clientes cl2 ON cl2.usuario = p2.cliente_usuario
-            JOIN mes m2 ON TRUE
-            WHERE p2.status = 'confirmado'
-              AND p2.confirmado_em >= m2.inicio
-              AND p2.confirmado_em < m2.fim
-              AND cl2.revendedor_id = r.id
-          ), 0) >= 15 THEN 50
-          ELSE 0
-        END AS bonus_mes
+        ), 0) AS clientes_ativos_mes
       FROM revendedores r
-      LEFT JOIN comissoes c ON c.revendedor_id = r.id
-      GROUP BY r.id
+      LEFT JOIN comissao c ON c.revendedor_id = r.id
+      LEFT JOIN bonus b ON b.revendedor_id = r.id
       ORDER BY r.id DESC
       `
     );
 
-    res.json({ ok: true, revendedores: result.rows });
+    const revendedores = result.rows.map(r => {
+      const bonusMes = Number(r.bonus_mes) || 0;
+      const bonusPago = Number(r.bonus_pago_mes) || 0;
+      const bonusPendente = Number(r.bonus_pendente_mes) || Math.max(0, bonusMes - bonusPago);
+      return { ...r, bonus_pago_mes: bonusPago, bonus_pendente_mes: bonusPendente };
+    });
+
+    res.json({ ok: true, revendedores });
   } catch (error) {
     console.error("Erro ao buscar revendedores:", error);
     res.status(500).json({ error: "Erro ao buscar revendedores." });
@@ -1757,10 +2798,16 @@ app.get("/revendedores/:id/comissoes", verificarToken, async (req, res) => {
   try {
     const result = await db.query(
       `
-      SELECT *
-      FROM comissoes
-      WHERE revendedor_id = $1
-      ORDER BY id DESC
+      SELECT
+        c.*,
+        cl.usuario AS cliente_usuario,
+        cl.nome AS cliente_nome,
+        cl.email AS cliente_email,
+        cl.telefone AS cliente_telefone
+      FROM comissoes c
+      JOIN clientes cl ON cl.id = c.cliente_id
+      WHERE c.revendedor_id = $1
+      ORDER BY c.id DESC
       LIMIT 200
       `,
       [id]
@@ -1817,7 +2864,23 @@ app.put("/revendedores/:id/aprovar", verificarToken, async (req, res) => {
     );
 
     if (result.rows.length === 0) return res.status(404).json({ error: "Revendedor nao encontrado." });
-    return res.json({ ok: true, revendedor: result.rows[0] });
+    const rev = result.rows[0];
+
+    // Confirma no Telegram do revendedor que foi aprovado.
+    await enviarTelegramAvisoAdmin(
+      [
+        "SG IPTV - Revendedor aprovado",
+        "",
+        `Email: ${rev.email}`,
+        `Codigo: ${rev.codigo}`,
+        "Status: aprovado",
+        "",
+        `Painel Admin: ${ADMIN_PANEL_URL}`
+      ].join("\n"),
+      "revendedor"
+    );
+
+    return res.json({ ok: true, revendedor: rev });
   } catch (error) {
     console.error("Erro ao aprovar revendedor:", error);
     return res.status(500).json({ error: "Erro ao aprovar revendedor." });
@@ -1843,7 +2906,23 @@ app.put("/revendedores/:id/reprovar", verificarToken, async (req, res) => {
     );
 
     if (result.rows.length === 0) return res.status(404).json({ error: "Revendedor nao encontrado." });
-    return res.json({ ok: true, revendedor: result.rows[0] });
+    const rev = result.rows[0];
+
+    // Confirma no Telegram do revendedor que foi reprovado.
+    await enviarTelegramAvisoAdmin(
+      [
+        "SG IPTV - Revendedor reprovado",
+        "",
+        `Email: ${rev.email}`,
+        `Codigo: ${rev.codigo}`,
+        "Status: reprovado",
+        "",
+        `Painel Admin: ${ADMIN_PANEL_URL}`
+      ].join("\n"),
+      "revendedor"
+    );
+
+    return res.json({ ok: true, revendedor: rev });
   } catch (error) {
     console.error("Erro ao reprovar revendedor:", error);
     return res.status(500).json({ error: "Erro ao reprovar revendedor." });
@@ -1854,15 +2933,476 @@ app.put("/pagamentos/:id/confirmar", verificarToken, async (req, res) => {
   const { id } = req.params;
 
   try {
-    await db.query(
-      "UPDATE pagamentos SET status = $1 WHERE id = $2",
-      ["confirmado", id]
-    );
+    const atual = await db.query("SELECT * FROM pagamentos WHERE id = $1 LIMIT 1", [id]);
+    if (atual.rows.length === 0) return res.status(404).json({ error: "Pagamento nao encontrado." });
+
+    // Confirma e roda fluxo completo (renova cliente, comissao, limpa teste, notifica se aplicavel).
+    await confirmarPagamentoRecebido(atual.rows[0], "admin_manual");
 
     res.json({ ok: true, message: "Pagamento confirmado" });
   } catch (error) {
     console.error("Erro ao confirmar pagamento:", error);
     res.status(500).json({ error: "Erro ao confirmar pagamento" });
+  }
+});
+
+app.get("/revendedores/:id/historico", verificarToken, async (req, res) => {
+  const id = String(req.params.id || "").trim();
+  if (!id) return res.status(400).json({ error: "Informe o id do revendedor." });
+
+  try {
+    const [comRes, bonusRes] = await Promise.all([
+      db.query(
+        `
+        SELECT
+          c.id, c.tipo, c.valor, c.status, c.transacao_id,
+          c.comprovante_nome, c.comprovante_mime, c.comprovante_tamanho,
+          c.criado_em, c.pago_em,
+          cl.usuario AS cliente_usuario, cl.nome AS cliente_nome
+        FROM comissoes c
+        JOIN clientes cl ON cl.id = c.cliente_id
+        WHERE c.revendedor_id = $1
+        ORDER BY c.id DESC
+        LIMIT 50
+        `,
+        [id]
+      ),
+      db.query(
+        `
+        SELECT id, mes, valor, status, transacao_id,
+               comprovante_nome, comprovante_mime, comprovante_tamanho,
+               criado_em, pago_em
+        FROM bonus_pagamentos
+        WHERE revendedor_id = $1
+        ORDER BY id DESC
+        LIMIT 24
+        `,
+        [id]
+      )
+    ]);
+
+    return res.json({ ok: true, comissoes: comRes.rows, bonus: bonusRes.rows });
+  } catch (error) {
+    console.error("Erro ao buscar historico do revendedor:", error);
+    return res.status(500).json({ error: "Erro ao buscar historico do revendedor." });
+  }
+});
+
+// Marcar comissoes como pagas (fluxo manual: admin faz o PIX e registra o comprovante).
+app.post("/revendedores/:id/comissoes/pagar", verificarToken, async (req, res) => {
+  const id = String(req.params.id || "").trim();
+  const transacaoId = req.body && req.body.transacao_id ? String(req.body.transacao_id).trim() : null;
+  const notificar = req.body && typeof req.body.notificar === "boolean" ? req.body.notificar : true;
+  const comprovante = req.body && req.body.comprovante ? req.body.comprovante : null;
+
+  if (!id) return res.status(400).json({ error: "Informe o id do revendedor." });
+
+  try {
+    const revRes = await db.query(`SELECT id, codigo, email, nome_completo, pix_cpf FROM revendedores WHERE id = $1 LIMIT 1`, [id]);
+    if (revRes.rows.length === 0) return res.status(404).json({ error: "Revendedor nao encontrado." });
+    const rev = revRes.rows[0];
+
+    const pend = await db.query(
+      `
+      SELECT COALESCE(SUM(valor), 0) AS total, COUNT(*) AS qtd
+      FROM comissoes
+      WHERE revendedor_id = $1 AND status = 'pendente'
+      `,
+      [id]
+    );
+
+    const total = Number(pend.rows[0]?.total || 0);
+    const qtd = Number(pend.rows[0]?.qtd || 0);
+    if (qtd <= 0) return res.json({ ok: true, message: "Sem comissoes pendentes.", total: 0, qtd: 0 });
+
+    const anexo = normalizarAnexoComprovante(comprovante);
+
+    await db.query(
+      `
+      UPDATE comissoes
+      SET status = 'pago',
+          transacao_id = COALESCE($2::text, transacao_id),
+          comprovante_nome = COALESCE($3::text, comprovante_nome),
+          comprovante_mime = COALESCE($4::text, comprovante_mime),
+          comprovante_tamanho = COALESCE($5::int, comprovante_tamanho),
+          comprovante_bytes = COALESCE($6::bytea, comprovante_bytes),
+          pago_em = NOW(),
+          atualizado_em = NOW()
+      WHERE revendedor_id = $1 AND status = 'pendente'
+      `,
+      [id, transacaoId, anexo ? anexo.filename : null, anexo ? anexo.contentType : null, anexo ? anexo.size : null, anexo ? anexo.content : null]
+    );
+
+    if (notificar && rev.email) {
+      const assunto = "SG IPTV - Comissao paga";
+      const text = [
+        "SG IPTV - Comissao paga",
+        "",
+        `Revendedor: ${rev.nome_completo || "-"} (${rev.codigo || "-"})`,
+        `PIX/CPF: ${rev.pix_cpf || "-"}`,
+        `Valor: R$ ${total.toFixed(2)}`,
+        `Itens: ${qtd}`,
+        transacaoId ? `Comprovante/ID: ${transacaoId}` : "",
+        "",
+        "Pagamento registrado no painel Admin."
+      ].filter(Boolean).join("\n");
+      await enviarEmailPara(rev.email, {
+        assunto,
+        text,
+        html: `<pre style="font-family:Arial, sans-serif; white-space:pre-wrap;">${text}</pre>`,
+        ...(anexo ? { attachments: [anexo] } : {})
+      });
+    }
+
+    return res.json({ ok: true, total, qtd });
+  } catch (error) {
+    console.error("Erro ao marcar comissoes como pagas:", error);
+    return res.status(500).json({ error: "Erro ao marcar comissoes como pagas." });
+  }
+});
+
+// Reanexar comprovante em comissoes ja pagas (quando o comprovante antigo nao foi salvo em bytes).
+// Atualiza todas as comissoes do revendedor com status='pago' e (opcional) transacao_id informado.
+app.post("/revendedores/:id/comissoes/anexar", verificarToken, async (req, res) => {
+  const id = String(req.params.id || "").trim();
+  const transacaoId = req.body && req.body.transacao_id ? String(req.body.transacao_id).trim() : null;
+  const comprovante = req.body && req.body.comprovante ? req.body.comprovante : null;
+
+  if (!id) return res.status(400).json({ error: "Informe o id do revendedor." });
+
+  try {
+    const anexo = normalizarAnexoComprovante(comprovante);
+    if (!anexo) return res.status(400).json({ error: "Informe um comprovante valido (PDF/PNG/JPG ate 2MB)." });
+
+    const whereTransacao = transacaoId ? "AND (transacao_id = $2::text OR $2::text = '')" : "";
+    const params = transacaoId
+      ? [id, transacaoId, anexo.filename, anexo.contentType, anexo.size, anexo.content]
+      : [id, anexo.filename, anexo.contentType, anexo.size, anexo.content];
+
+    const q = transacaoId
+      ? `
+        UPDATE comissoes
+        SET comprovante_nome = $3::text,
+            comprovante_mime = $4::text,
+            comprovante_tamanho = $5::int,
+            comprovante_bytes = $6::bytea,
+            atualizado_em = NOW()
+        WHERE revendedor_id = $1
+          AND status = 'pago'
+          ${whereTransacao}
+      `
+      : `
+        UPDATE comissoes
+        SET comprovante_nome = $2::text,
+            comprovante_mime = $3::text,
+            comprovante_tamanho = $4::int,
+            comprovante_bytes = $5::bytea,
+            atualizado_em = NOW()
+        WHERE revendedor_id = $1
+          AND status = 'pago'
+      `;
+
+    const r = await db.query(q, params);
+    return res.json({ ok: true, atualizadas: r.rowCount || 0 });
+  } catch (error) {
+    console.error("Erro ao reanexar comprovante de comissoes:", error);
+    return res.status(500).json({ error: "Erro ao anexar comprovante." });
+  }
+});
+
+// Marcar bonus do mes como pago (fluxo manual: admin faz o PIX e registra o comprovante).
+app.post("/revendedores/:id/bonus/pagar", verificarToken, async (req, res) => {
+  const id = String(req.params.id || "").trim();
+  const transacaoId = req.body && req.body.transacao_id ? String(req.body.transacao_id).trim() : null;
+  const notificar = req.body && typeof req.body.notificar === "boolean" ? req.body.notificar : true;
+  const comprovante = req.body && req.body.comprovante ? req.body.comprovante : null;
+
+  if (!id) return res.status(400).json({ error: "Informe o id do revendedor." });
+
+  try {
+    const revRes = await db.query(`SELECT id, codigo, email, nome_completo, pix_cpf FROM revendedores WHERE id = $1 LIMIT 1`, [id]);
+    if (revRes.rows.length === 0) return res.status(404).json({ error: "Revendedor nao encontrado." });
+    const rev = revRes.rows[0];
+
+    // Bonus do mes: preferimos o que esta registrado em bonus_pagamentos (pendente/pago).
+    // (A regra automatica de >10 vendas pode ser usada no futuro para criar o registro pendente automaticamente.)
+    const bonusRes = await db.query(
+      `
+      WITH mes AS (
+        SELECT date_trunc('month', NOW())::date AS mes_date
+      )
+      SELECT
+        COALESCE(SUM(CASE WHEN bp.status = 'pendente' THEN bp.valor ELSE 0 END), 0) AS bonus_pendente_mes,
+        COALESCE(SUM(CASE WHEN bp.status = 'pago' THEN bp.valor ELSE 0 END), 0) AS bonus_pago_mes
+      FROM bonus_pagamentos bp
+      JOIN mes m ON TRUE
+      WHERE bp.revendedor_id = $1
+        AND bp.mes = m.mes_date
+      `,
+      [id]
+    );
+
+    const bonusPendente = Number(bonusRes.rows[0]?.bonus_pendente_mes || 0);
+    const bonusPago = Number(bonusRes.rows[0]?.bonus_pago_mes || 0);
+
+    if (bonusPendente <= 0) {
+      return res.json({ ok: true, message: "Sem bonus pendente no mes.", valor: 0 });
+    }
+
+    const anexo = normalizarAnexoComprovante(comprovante);
+
+    // Marca todos os bonus pendentes do mes como pago e anexa o comprovante/ID (mesma ref para o lote).
+    await db.query(
+      `
+      UPDATE bonus_pagamentos
+      SET status = 'pago',
+          transacao_id = COALESCE($2::text, transacao_id),
+          comprovante_nome = COALESCE($3::text, comprovante_nome),
+          comprovante_mime = COALESCE($4::text, comprovante_mime),
+          comprovante_tamanho = COALESCE($5::int, comprovante_tamanho),
+          comprovante_bytes = COALESCE($6::bytea, comprovante_bytes),
+          pago_em = COALESCE(pago_em, NOW()),
+          atualizado_em = NOW()
+      WHERE revendedor_id = $1
+        AND mes = date_trunc('month', NOW())::date
+        AND status = 'pendente'
+      `,
+      [id, transacaoId, anexo ? anexo.filename : null, anexo ? anexo.contentType : null, anexo ? anexo.size : null, anexo ? anexo.content : null]
+    );
+
+    if (notificar && rev.email) {
+      const assunto = "SG IPTV - Bonus pago";
+      const text = [
+        "SG IPTV - Bonus pago",
+        "",
+        `Revendedor: ${rev.nome_completo || "-"} (${rev.codigo || "-"})`,
+        `PIX/CPF: ${rev.pix_cpf || "-"}`,
+        `Valor: R$ ${bonusPendente.toFixed(2)}`,
+        transacaoId ? `Comprovante/ID: ${transacaoId}` : "",
+        "",
+        "Pagamento registrado no painel Admin."
+      ].filter(Boolean).join("\n");
+      await enviarEmailPara(rev.email, {
+        assunto,
+        text,
+        html: `<pre style="font-family:Arial, sans-serif; white-space:pre-wrap;">${text}</pre>`,
+        ...(anexo ? { attachments: [anexo] } : {})
+      });
+    }
+
+    return res.json({ ok: true, valor: bonusPendente });
+  } catch (error) {
+    console.error("Erro ao marcar bonus como pago:", error);
+    return res.status(500).json({ error: "Erro ao marcar bonus como pago." });
+  }
+});
+
+// Atualiza campos auxiliares do pagamento (para testes/auditoria no painel).
+app.put("/pagamentos/:id/detalhes", verificarToken, async (req, res) => {
+  const { id } = req.params;
+  const cliente_usuario = req.body?.cliente_usuario ? String(req.body.cliente_usuario).trim() : null;
+  const cliente_senha = req.body?.cliente_senha ? String(req.body.cliente_senha).trim() : null;
+  const email = req.body?.email ? String(req.body.email).trim().toLowerCase() : null;
+  const telefone = req.body?.telefone ? String(req.body.telefone).replace(/\D/g, "") : null;
+  const origem = req.body?.origem ? String(req.body.origem).trim().toLowerCase() : null;
+
+  const origemFinal = origem === "pix" || origem === "dinheiro" ? origem : null;
+
+  try {
+    // Se for um pagamento associado a um cliente, permite "puxar do cadastro" e salvar aqui.
+    // Aceitamos email/telefone vazios como "nao alterar". Para limpar, o admin deve excluir e recriar.
+    const result = await db.query(
+      `
+      UPDATE pagamentos
+      SET cliente_usuario = COALESCE($2, cliente_usuario),
+          cliente_senha = COALESCE($3, cliente_senha),
+          email = COALESCE($4, email),
+          telefone = COALESCE($5, telefone),
+          origem = COALESCE($6, origem),
+          atualizado_em = NOW()
+      WHERE id = $1
+      RETURNING *
+      `,
+      [id, cliente_usuario, cliente_senha, email, telefone, origemFinal]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Pagamento nao encontrado." });
+    }
+
+    const atualizado = result.rows[0];
+
+    // Se o pagamento ja estiver confirmado, tenta reconciliar dados (plano/vencimento/comissao).
+    if (String(atualizado.status) === "confirmado") {
+      try {
+        await aplicarRenovacaoCliente(atualizado);
+        await limparTesteIptvDoCliente({
+          usuario: atualizado.cliente_usuario,
+          email: atualizado.email,
+          telefone: atualizado.telefone
+        });
+        await garantirComissaoDoPagamentoConfirmado(atualizado);
+      } catch (e) {
+        console.error("Aviso: falha ao reconciliar pagamento confirmado (continuando):", e?.message || e);
+      }
+    }
+
+    return res.json({ ok: true, pagamento: enriquecerPagamento(atualizado) });
+  } catch (error) {
+    console.error("Erro ao atualizar detalhes do pagamento:", error);
+    return res.status(500).json({ error: "Erro ao atualizar detalhes do pagamento.", detail: String(error?.message || error) });
+  }
+});
+
+// Excluir pagamento (apenas para limpar testes/pendentes/cancelados no painel).
+app.delete("/pagamentos/:id", verificarToken, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const atual = await db.query(
+      `SELECT id, status, plano, payment_id FROM pagamentos WHERE id = $1 LIMIT 1`,
+      [id]
+    );
+
+    if (atual.rows.length === 0) {
+      return res.status(404).json({ error: "Pagamento nao encontrado." });
+    }
+
+    const p = atual.rows[0];
+    const plano = String(p.plano || "");
+    const paymentId = String(p.payment_id || "");
+    const status = String(p.status || "");
+
+    await db.query(`DELETE FROM pagamentos WHERE id = $1`, [id]);
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error("Erro ao excluir pagamento:", error);
+    return res.status(500).json({ error: "Erro ao excluir pagamento.", detail: String(error?.message || error) });
+  }
+});
+
+// Excluir teste IPTV (apenas limpeza de testes no painel).
+app.delete("/testes-iptv/:id", verificarToken, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const atual = await db.query(`SELECT id FROM testes_iptv WHERE id = $1 LIMIT 1`, [id]);
+    if (atual.rows.length === 0) return res.status(404).json({ error: "Teste nao encontrado." });
+
+    await db.query(`DELETE FROM testes_iptv WHERE id = $1`, [id]);
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error("Erro ao excluir teste IPTV:", error);
+    return res.status(500).json({ error: "Erro ao excluir teste IPTV.", detail: String(error?.message || error) });
+  }
+});
+
+// Excluir cliente (apenas limpeza de cadastros de teste/errados no painel).
+app.delete("/clientes/:id", verificarToken, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const atual = await db.query(`SELECT id FROM clientes WHERE id = $1 LIMIT 1`, [id]);
+    if (atual.rows.length === 0) return res.status(404).json({ error: "Cliente nao encontrado." });
+
+    await db.query(`DELETE FROM clientes WHERE id = $1`, [id]);
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error("Erro ao excluir cliente:", error);
+    return res.status(500).json({ error: "Erro ao excluir cliente.", detail: String(error?.message || error) });
+  }
+});
+
+// Excluir revendedor (limpeza no painel).
+app.delete("/revendedores/:id", verificarToken, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const atual = await db.query(`SELECT id FROM revendedores WHERE id = $1 LIMIT 1`, [id]);
+    if (atual.rows.length === 0) return res.status(404).json({ error: "Revendedor nao encontrado." });
+
+    await db.query(`DELETE FROM revendedores WHERE id = $1`, [id]);
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error("Erro ao excluir revendedor:", error);
+    return res.status(500).json({ error: "Erro ao excluir revendedor.", detail: String(error?.message || error) });
+  }
+});
+
+// Confirmacao manual (pagamento em dinheiro).
+app.post("/pagamentos/dinheiro", verificarToken, async (req, res) => {
+  const {
+    email,
+    telefone,
+    plano,
+    valor,
+    cliente_usuario,
+    cliente_senha,
+    confirmado_em
+  } = req.body || {};
+
+  const emailNorm = String(email || "").trim().toLowerCase();
+  const telNorm = String(telefone || "").replace(/\D/g, "");
+  const planoNorm = String(plano || "").trim();
+  const valorNum = Number(valor);
+
+  // Pagamento em dinheiro: obrigatorio apenas plano + valor.
+  // Email/WhatsApp sao opcionais (podem vir vazios) e servem apenas para registro/relatorio.
+  if (!planoNorm || !Number.isFinite(valorNum) || valorNum <= 0) {
+    return res.status(400).json({ error: "Informe plano e valor." });
+  }
+
+  const paymentId = `DINHEIRO-${Date.now()}`;
+  const confirmadoEm = confirmado_em ? new Date(confirmado_em) : new Date();
+
+  try {
+    const inserted = await db.query(
+      `
+      INSERT INTO pagamentos (email, telefone, plano, valor, status, payment_id, cliente_usuario, cliente_senha, confirmado_em, criado_em, atualizado_em, origem)
+      VALUES ($1, $2, $3, $4, 'confirmado', $5, $6, $7, $8, NOW(), NOW(), 'dinheiro')
+      RETURNING *
+      `,
+      [
+        emailNorm || null,
+        telNorm || null,
+        planoNorm,
+        valorNum,
+        paymentId,
+        cliente_usuario ? String(cliente_usuario).trim() : null,
+        cliente_senha ? String(cliente_senha).trim() : null,
+        confirmadoEm
+      ]
+    );
+
+    // Renovacao do cliente (se houver login/email/telefone).
+    try {
+      await aplicarRenovacaoCliente(inserted.rows[0]);
+      await garantirComissaoDoPagamentoConfirmado(inserted.rows[0]);
+    } catch (e) {
+      console.error("Erro ao aplicar renovacao no cliente (dinheiro):", e);
+    }
+
+    // Notifica admin (telegram/email/whatsapp), assim como no PIX.
+    try {
+      await notificarVendaAdmin({
+        tipo: "Pagamento confirmado (dinheiro)",
+        pagamento: inserted.rows[0],
+        origem: "dinheiro",
+        telegramTipo: "pix"
+      });
+      await db.query("UPDATE pagamentos SET notificado_em = NOW() WHERE id = $1", [Number(inserted.rows[0].id)]);
+      inserted.rows[0].notificado_em = new Date().toISOString();
+    } catch (e) {
+      console.error("Erro ao notificar venda admin (dinheiro):", e);
+    }
+
+    return res.json({ ok: true, pagamento: enriquecerPagamento(inserted.rows[0]) });
+  } catch (error) {
+    console.error("Erro ao confirmar pagamento em dinheiro:", error);
+    return res.status(500).json({
+      error: "Erro ao confirmar pagamento em dinheiro.",
+      detail: String(error?.message || error)
+    });
   }
 });
 
@@ -1872,20 +3412,145 @@ app.post("/webhook", async (req, res) => {
       return res.status(401).json({ error: "Webhook sem autorizacao." });
     }
 
-    const paymentId = req.body?.data?.id;
+    const paymentId = req.body?.data?.id || req.body?.id;
 
     if (!paymentId) return res.sendStatus(200);
 
-    const payment = new Payment(client);
-    const result = await payment.get({ id: paymentId });
+    // Primeiro tenta achar no banco; se nao existir (caso real: pagamento feito fora do nosso /pix),
+    // faz um "auto-import" pelo paymentId para o PIX nao sumir do painel/admin.
+    const pagamentoResult = await db.query(
+      "SELECT * FROM pagamentos WHERE payment_id = $1 ORDER BY id DESC LIMIT 1",
+      [String(paymentId)]
+    );
 
-    if (result.status === "approved") {
-      await db.query(
-        "UPDATE pagamentos SET status = $1 WHERE payment_id = $2",
-        ["confirmado", String(paymentId)]
-      );
+    if (pagamentoResult.rows.length > 0) {
+      await sincronizarPagamentoMercadoPago(pagamentoResult.rows[0]);
+    } else {
+      try {
+        const payment = new Payment(client);
+        const mp = await payment.get({ id: String(paymentId) });
 
-      console.log("✅ Pagamento confirmado automaticamente");
+        const plano = String(mp?.description || "Pagamento PIX (webhook)").trim();
+        const valor = Number(mp?.transaction_amount || 0);
+        const mpEmail = String(mp?.payer?.email || "").trim().toLowerCase() || null;
+        const telefone = null;
+
+        const status =
+          mp?.status === "approved" ? "confirmado" :
+          mp?.status === "cancelled" ? "cancelado" :
+          "pendente";
+
+        const confirmadoEm = status === "confirmado" ? (mp?.date_approved ? new Date(mp.date_approved) : new Date()) : null;
+
+        // Tentativa de vinculo automatico (modo B):
+        // 1) Se achar 1 cliente exatamente pelo email do Mercado Pago, vincula.
+        // 2) Se o "plano/description" vier no formato "C-<usuario>", tenta vincular por usuario (somente se existir 1 cliente).
+        // Se encontrar 0 ou mais de 1, mantemos sem vinculo e sem renovar, para evitar vincular errado.
+        let clienteVinculado = null;
+        if (mpEmail) {
+          try {
+            const cRes = await db.query(
+              `
+              SELECT id, usuario, senha, email, telefone
+              FROM clientes
+              WHERE lower(email) = $1
+              ORDER BY atualizado_em DESC, id DESC
+              `,
+              [mpEmail]
+            );
+            if (cRes.rows.length === 1) {
+              clienteVinculado = cRes.rows[0];
+            }
+          } catch (e) {
+            console.error("Erro webhook(auto-import: lookup cliente por email):", e);
+          }
+        }
+
+        // Fallback: se a description vier como C-<usuario>, vincula por usuario (1:1).
+        if (!clienteVinculado) {
+          const mUsuario = /^C-(\d+)$/.exec(String(plano || "").trim());
+          const usuarioFromDesc = mUsuario?.[1] ? String(mUsuario[1]).trim() : "";
+          if (usuarioFromDesc) {
+            try {
+              const uRes = await db.query(
+                `
+                SELECT id, usuario, senha, email, telefone
+                FROM clientes
+                WHERE usuario = $1
+                ORDER BY atualizado_em DESC, id DESC
+                `,
+                [usuarioFromDesc]
+              );
+              if (uRes.rows.length === 1) {
+                clienteVinculado = uRes.rows[0];
+              }
+            } catch (e) {
+              console.error("Erro webhook(auto-import: lookup cliente por usuario):", e);
+            }
+          }
+        }
+
+        const insertRes = await db.query(
+          `
+          INSERT INTO pagamentos (email, telefone, plano, valor, status, payment_id, confirmado_em, origem)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+          RETURNING *
+          `,
+          [
+            // Se conseguimos vincular, gravamos o email/telefone do cadastro; caso contrario, gravamos o email do MP.
+            (clienteVinculado?.email || mpEmail || null),
+            (clienteVinculado?.telefone || null),
+            plano,
+            valor,
+            status,
+            String(paymentId),
+            confirmadoEm,
+            "pix_webhook_import"
+          ]
+        );
+
+        const salvo = insertRes.rows[0];
+        if (salvo) {
+          // Se conseguimos vincular 1:1, completamos o pagamento com usuario/senha e normalizamos o plano
+          // para que a renovacao funcione automaticamente.
+          if (clienteVinculado) {
+            const planoNorm = normalizarNomePlanoParaCliente({ ...salvo, plano: salvo.plano, valor: salvo.valor });
+            try {
+              const up = await db.query(
+                `
+                UPDATE pagamentos
+                SET cliente_usuario = $1,
+                    cliente_senha = $2,
+                    plano = $3,
+                    email = $4,
+                    telefone = $5,
+                    atualizado_em = NOW()
+                WHERE id = $6
+                RETURNING *
+                `,
+                [
+                  String(clienteVinculado.usuario || "").trim() || null,
+                  String(clienteVinculado.senha || "").trim() || null,
+                  planoNorm || salvo.plano,
+                  clienteVinculado.email || salvo.email,
+                  clienteVinculado.telefone || salvo.telefone,
+                  Number(salvo.id)
+                ]
+              );
+              if (up.rows[0]) {
+                // Se estiver aprovado, agora sim reconcilia/renova/notifica.
+                if (up.rows[0].status === "confirmado") {
+                  await processarPagamentoConfirmado(up.rows[0], "pix_webhook_import");
+                }
+              }
+            } catch (e) {
+              console.error("Erro webhook(auto-import: vincular pagamento ao cliente):", e);
+            }
+          }
+        }
+      } catch (e) {
+        console.error("Erro webhook(auto-import):", e);
+      }
     }
 
     res.sendStatus(200);
@@ -1964,6 +3629,15 @@ app.post("/cliente/consulta", limitePublico, async (req, res) => {
 
       const cliente = result.rows[0];
 
+      // Busca (se houver) o codigo do revendedor vinculado, para exibir no painel do cliente.
+      let revendedorCodigo = null;
+      if (cliente.revendedor_id) {
+        try {
+          const rev = await db.query(`SELECT codigo FROM revendedores WHERE id = $1 LIMIT 1`, [cliente.revendedor_id]);
+          revendedorCodigo = rev.rows[0]?.codigo || null;
+        } catch {}
+      }
+
       avisarVencimentosClientes().catch(err => console.error("Erro avisos vencimento:", err));
 
       return res.json({
@@ -1977,7 +3651,8 @@ app.post("/cliente/consulta", limitePublico, async (req, res) => {
           vencimento: cliente.vencimento,
           nome: cliente.nome,
           email: cliente.email,
-          telefone: cliente.telefone
+          telefone: cliente.telefone,
+          revendedor_codigo: revendedorCodigo
         }
       });
     } catch (error) {
@@ -2098,6 +3773,24 @@ app.post("/admin/teste-emails-vencimento", verificarToken, async (req, res) => {
       return res.status(400).json({ error: String(mailError?.message || mailError || "Falha ao enviar email.") });
     }
 
+    // Tambem envia Telegram para validar o canal de vencimentos.
+    // Se TELEGRAM_CHAT_ID_VENCIMENTO_3D nao existir, cai no chat base.
+    const baseTexto = (dias) => `
+Vencimento em ${dias} dia${dias === 1 ? "" : "s"} (TESTE) - SG IPTV
+
+Cliente: ${cliente.nome || "-"}
+Usuario: ${cliente.usuario}
+Plano: ${cliente.plano}
+Vencimento: ${formatarDataPtBr(cliente.vencimento)}
+Email: ${cliente.email || "-"}
+WhatsApp: ${cliente.telefone || "-"}
+
+Painel Admin: ${ADMIN_PANEL_URL}
+    `.trim();
+
+    await enviarTelegramAvisoAdmin(baseTexto(3), "vencimento_3d");
+    await enviarTelegramAvisoAdmin(baseTexto(1), "vencimento_1d");
+
     return res.json({ ok: true });
   } catch (error) {
     console.error("Erro ao enviar emails teste:", error);
@@ -2120,6 +3813,50 @@ app.post("/admin/telegram/teste", verificarToken, async (req, res) => {
   } catch (error) {
     console.error("Erro ao testar Telegram:", error);
     return res.status(500).json({ error: "Erro ao testar Telegram." });
+  }
+});
+
+app.post("/admin/email/teste", verificarToken, async (req, res) => {
+  try {
+    const { assunto, texto } = req.body || {};
+    const subj = String(assunto || "Teste Email - SG IPTV").trim();
+    const body = String(texto || "Teste de envio de email do backend SG IPTV.").trim();
+
+    const ok = await enviarEmailAvisoAdmin({
+      assunto: subj,
+      text: body,
+      html: `<pre style="font-family:Arial, sans-serif; white-space:pre-wrap;">${escaparHtml(body)}</pre>`
+    });
+
+    if (!ok) {
+      return res.status(400).json({
+        error: "Email nao enviado. Verifique BREVO_API_KEY+EMAIL_FROM, ou SMTP_HOST/SMTP_USER/SMTP_PASS, ou EMAIL_USER/EMAIL_PASS."
+      });
+    }
+
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error("Erro ao testar email:", error);
+    return res.status(500).json({ error: "Erro ao testar email." });
+  }
+});
+
+app.post("/admin/whatsapp/teste", verificarToken, async (req, res) => {
+  try {
+    const { texto } = req.body || {};
+    const msg = String(texto || "Teste WhatsApp - SG IPTV").trim();
+
+    const ok = await enviarWhatsappAvisoAdmin(msg);
+    if (!ok) {
+      return res.status(400).json({
+        error: "WhatsApp nao enviado. Verifique ADMIN_WHATSAPP_APIKEY e ADMIN_WHATSAPP_NUMBER."
+      });
+    }
+
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error("Erro ao testar WhatsApp:", error);
+    return res.status(500).json({ error: "Erro ao testar WhatsApp." });
   }
 });
 
@@ -2205,6 +3942,28 @@ app.post("/teste-iptv", limitePublico, async (req, res) => {
     const dadosTeste = extrairLoginSenha(textoFormatado);
     const agoraIso = new Date().toISOString();
     const vencimentoTeste = adicionarTempo(agoraIso, TESTE_DURACAO_HORAS, "horas");
+
+    // Garante que o cliente consegue entrar na Area do Cliente imediatamente apos gerar o teste,
+    // sem depender do envio de email. (usuario = login, senha = senha extraidos do painel IPTV)
+    try {
+      await db.query(
+        `
+        INSERT INTO clientes (usuario, senha, plano, conexoes, criado_em, vencimento, email, telefone, atualizado_em)
+        VALUES ($1, $2, $3, $4, NOW(), $5, $6, $7, NOW())
+        ON CONFLICT (usuario) DO UPDATE
+          SET senha = EXCLUDED.senha,
+              plano = EXCLUDED.plano,
+              conexoes = EXCLUDED.conexoes,
+              vencimento = EXCLUDED.vencimento,
+              email = EXCLUDED.email,
+              telefone = EXCLUDED.telefone,
+              atualizado_em = NOW()
+        `,
+        [dadosTeste.login, dadosTeste.senha, "TESTE GRATUITO", 1, vencimentoTeste, email, telefone]
+      );
+    } catch (clienteError) {
+      console.error("Erro ao salvar teste em clientes:", clienteError);
+    }
 
     try {
       await db.query(
@@ -2322,7 +4081,10 @@ Painel Admin: ${ADMIN_PANEL_URL}
         ? "Teste gerado e enviado para seu email."
         : "Teste gerado. As configurações aparecerão na tela.",
       resposta: textoFormatado,
-      emailEnviado
+      emailEnviado,
+      usuario: dadosTeste.login,
+      senha: dadosTeste.senha,
+      vencimento: vencimentoTeste
     });
 
   } catch (error) {
@@ -2335,6 +4097,20 @@ const PORT = process.env.PORT || 4000;
 
 app.listen(PORT, () => {
   console.log("🚀 Backend rodando na porta", PORT);
+
+  // Scheduler de vencimentos: roda diariamente as 09:00.
+  iniciarSchedulerVencimentos();
+
+  // Backfill: garante comissoes para pagamentos confirmados que ficaram sem comissao
+  // (por exemplo: pagamento confirmado antes/fora do fluxo normal).
+  // Delay pequeno para o banco e as rotinas de "garantir tabelas/colunas" concluirem.
+  setTimeout(() => {
+    try {
+      backfillComissoesRecentes();
+    } catch (e) {
+      console.error("Erro ao iniciar backfillComissoesRecentes:", e?.message || e);
+    }
+  }, 8000);
 });
 
 app.get("/testes-iptv", verificarToken, async (req, res) => {
